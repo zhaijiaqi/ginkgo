@@ -1,5 +1,5 @@
 cg:
-  max_iter: 100
+  max_iter: 1000
   stop_tol: 1e-10
   matrix_size: 1024  # 矩阵大小 (n x n)，当使用真实矩阵时会被覆盖
   matrix_name: Muu  # 矩阵名称，从 matrix_set.csv 中选择

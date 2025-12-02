@@ -9,7 +9,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import yaml
 import numpy as np
 import torch
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import logging
 import json
 from datetime import datetime
@@ -27,45 +27,71 @@ class MockPPOAgent:
     在真实实现中，这将被替换为真正的 pfrl PPO 代理
     """
 
-    def __init__(self, state_dim: int, action_size: int):
+    def __init__(self, state_dim: int, action_size: int, tilesize: int = 32):
         self.state_dim = state_dim
         self.action_size = action_size
-        self.model = create_cg_model(state_dim, action_size, (64, 64))
+        self.tilesize = tilesize
+
+        # 计算单个 tile 的状态维度
+        self.tile_state_dim = tilesize + 1
+        self.num_tiles = state_dim // self.tile_state_dim
+
+        # 创建共享模型，所有 tile 使用同一个模型
+        self.model = create_cg_model(self.tile_state_dim, action_size, (64, 64))
 
         # 简单的 epsilon-greedy 策略
         self.epsilon = 0.1
 
-    def act(self, obs: np.ndarray, deterministic: bool = False) -> int:
-        """选择动作"""
-        if np.random.random() < self.epsilon:
-            return np.random.randint(self.action_size)
-        else:
-            with torch.no_grad():
-                obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
-                logits, _ = self.model(obs_tensor)
-                probs = torch.softmax(logits, dim=-1).squeeze(0)
+    def act(self, obs: np.ndarray, deterministic: bool = False) -> List[int]:
+        """选择所有 tiles 的动作"""
+        actions = []
+        for tile_idx in range(self.num_tiles):
+            # 提取当前 tile 的状态
+            start_idx = tile_idx * self.tile_state_dim
+            end_idx = start_idx + self.tile_state_dim
+            tile_obs = obs[start_idx:end_idx]
 
-                # 直接在 tensor 上检查，无需转到 CPU/NumPy
-                if (
-                    torch.any(torch.isnan(probs))
-                    or torch.any(torch.isinf(probs))
-                    or torch.any(probs < 0)
-                ):
-                    return np.random.randint(self.action_size)
-                else:
-                    return torch.multinomial(probs, 1).item()
+            if np.random.random() < self.epsilon:
+                action = np.random.randint(self.action_size)
+            else:
+                with torch.no_grad():
+                    obs_tensor = torch.FloatTensor(tile_obs).unsqueeze(0)
+                    # print(f"{obs_tensor.size()}")
+                    logits, _ = self.model(obs_tensor)
+                    probs = torch.softmax(logits, dim=-1).squeeze(0)
 
-    def observe(self, obs, action, reward, next_obs, done):
+                    # 直接在 tensor 上检查，无需转到 CPU/NumPy
+                    if (
+                        torch.any(torch.isnan(probs))
+                        or torch.any(torch.isinf(probs))
+                        or torch.any(probs < 0)
+                    ):
+                        action = np.random.randint(self.action_size)
+                    else:
+                        action = torch.multinomial(probs, 1).item()
+
+            actions.append(action)
+
+        # print(f"actions length: {len(actions)}")
+        # print(f"actions: {actions}")
+        return actions
+
+    def observe(self, obs, actions, reward, next_obs, done):
         """观察经验 (暂时不更新)"""
         pass
 
     def save(self, path: str):
         """保存模型"""
-        torch.save(self.model.state_dict(), path)
+        torch.save({
+            'model_state': self.model.state_dict(),
+            'tilesize': self.tilesize,
+            'num_tiles': self.num_tiles
+        }, path)
 
     def load(self, path: str):
         """加载模型"""
-        self.model.load_state_dict(torch.load(path))
+        checkpoint = torch.load(path)
+        self.model.load_state_dict(checkpoint['model_state'])
 
 
 class TrainingLogger:
@@ -195,7 +221,6 @@ def train_cg_ppo(config: Dict):
         'normalize_state': config.get('env', {}).get('normalize_state', True)
     }
     env = CGEnvironment(env_config)
-
     state_dim = env.get_state_dim()
     action_size = env.get_action_space_size()
 
@@ -214,60 +239,56 @@ def train_cg_ppo(config: Dict):
 
     # 训练参数
     train_config = config.get('train', {})
-    total_steps = train_config.get('total_steps', 10000)
-    eval_interval = train_config.get('eval_interval', 1000)
-    save_interval = train_config.get('save_interval', 5000)
-    log_interval = train_config.get('log_interval', 100)
+    total_iterations = train_config.get('total_steps', 10000)  # 现在 total_steps 表示总迭代次数
+    eval_interval = train_config.get('eval_interval', 50)
+    save_interval = train_config.get('save_interval', 50)
+    log_interval = train_config.get('log_interval', 10)
 
-    print(f"总训练步数: {total_steps}")
+    print(f"总训练迭代次数: {total_iterations}")
     print(f"评估间隔: {eval_interval}")
     print(f"保存间隔: {save_interval}")
 
     # 训练循环
-    step_count = 0
+    iteration_count = 0
     episode_count = 0
-
-    # 新增：以episode为单位的定期评估和保存，转换interval为以episode为单位
-    eval_episode_interval = max(1, eval_interval // (step_count // max(1, episode_count)) if episode_count > 0 else eval_interval)
-    save_episode_interval = max(1, save_interval // (step_count // max(1, episode_count)) if episode_count > 0 else save_interval)
-    # 为保证行为和设置一致，我们直接以episode为准，interval等于之前的step-based interval除以平均每集步数
-    # 但首次需要先采集至少一个episode，下面逻辑中延后计算
 
     episodes_since_last_eval = 0
     episodes_since_last_save = 0
 
     avg_steps_per_episode = 1  # 初始化，第一轮后更新
 
-    while step_count < total_steps:
+    while iteration_count < total_iterations:
         # 开始一个 episode
         episode_reward = 0
-        episode_steps = 0
+        episode_iterations = 0
         done = False
 
-        # 重置环境
+        # 一次cg求解结束，重置环境
         obs = env.reset(seed=episode_count)
+        
+        # print(f"len(obs): {len(obs)}")
 
-        while not done and step_count < total_steps:
-            # 选择动作
-            action = agent.act(obs)
+        while not done and iteration_count < total_iterations:
+            # 选择所有 tiles 的动作
+            actions = agent.act(obs)
 
-            # 执行动作
-            next_obs, reward, done, info = env.step(action)
+            # 执行一步（一次完整的 CG 迭代）
+            next_obs, reward, done, info = env.step(actions)
 
             # 记录经验
-            agent.observe(obs, action, reward, next_obs, done)
+            agent.observe(obs, actions, reward, next_obs, done)
 
             # 更新统计
             episode_reward += reward
-            episode_steps += 1
-            step_count += 1
+            episode_iterations += 1
+            iteration_count += 1
 
             # 记录步骤
-            logger.log_step(step_count, reward)
+            logger.log_step(iteration_count, reward)
 
             # 定期日志
-            if step_count % log_interval == 0:
-                print(f"Step {step_count}: episode {episode_count}, reward {reward:.3f}")
+            if iteration_count % log_interval == 0:
+                print(f"Iteration {iteration_count}: episode {episode_count}, reward {reward:.3f}")
 
             obs = next_obs
 
@@ -278,9 +299,9 @@ def train_cg_ppo(config: Dict):
 
         episode_info = env.get_episode_info()
         episode_stats = {
-            'steps': episode_steps,
+            'iterations': episode_iterations,
             'total_reward': episode_reward,
-            'avg_reward': episode_reward / episode_steps,
+            'avg_reward': episode_reward / episode_iterations,
             **episode_info
         }
 
@@ -288,22 +309,14 @@ def train_cg_ppo(config: Dict):
 
         print(f"Episode {episode_count} 完成: total_reward {episode_stats.get('total_reward', 0):.3f}, iterations {episode_stats.get('iterations', 0)}, converged {episode_stats.get('converged', False)}")
 
-        # 更新平均每集步数，用于后续动态间隔（episode为单位）
-        avg_steps_per_episode = ((avg_steps_per_episode * (episode_count - 1)) + episode_steps) / episode_count
-
-        # 用step-based的间隔除以平均每集步数，得到约等于原本step间隔的episode数
-        # 保证至少为1
-        eval_episode_interval = max(1, int(eval_interval / avg_steps_per_episode))
-        save_episode_interval = max(1, int(save_interval / avg_steps_per_episode))
-
         # 定期评估（以episode为单位）
-        if episodes_since_last_eval >= eval_episode_interval:
+        if episodes_since_last_eval >= eval_interval:
             eval_stats = evaluate_agent(env, agent, num_episodes=1)
             print(f"评估结果 (Episode {episode_count}): {eval_stats}")
             episodes_since_last_eval = 0
 
         # 定期保存（以episode为单位）
-        if episodes_since_last_save >= save_episode_interval:
+        if episodes_since_last_save >= save_interval:
             model_path = os.path.join(log_dir, f'model_episode_{episode_count}.pt')
             agent.save(model_path)
             print(f"模型已保存: {model_path}")
@@ -346,8 +359,8 @@ def evaluate_agent(env: CGEnvironment, agent: MockPPOAgent, num_episodes: int = 
         done = False
 
         while not done:
-            action = agent.act(obs)
-            next_obs, reward, done, info = env.step(action)
+            actions = agent.act(obs)
+            next_obs, reward, done, info = env.step(actions)
             episode_reward += reward
             obs = next_obs
 

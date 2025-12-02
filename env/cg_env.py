@@ -42,9 +42,8 @@ class CGEnvironment:
         self.config = config
 
         # CG 参数
-        self.max_iter = int(config.get('max_iter', 50))
+        self.max_iter = int(config.get('max_iter', 1000))
         self.stop_tol = float(config.get('stop_tol', 1e-6))
-        self.matrix_size = config.get('matrix_size', 1024)
 
         # 矩阵配置
         self.matrix_name = config.get('matrix_name', None)  # 矩阵名称，如果为None则使用随机生成
@@ -88,6 +87,7 @@ class CGEnvironment:
         self.A_matrix = None  # scipy csr_matrix
         self.A_sparse = None  # 我们的 SparseMatrix 格式
         self.A_diagonal = None  # 对角线元素（用于兼容现有代码）
+        self.matrix_loaded = False  # 标记矩阵是否已加载
 
         # 轨迹跟踪
         self.episode_cpt_cost = 0.0
@@ -96,10 +96,15 @@ class CGEnvironment:
 
         # 动作空间：6 种精度选择
         self.action_space_n = 6
+      
+        # 重置环境
+        self.reset()
 
         # 状态空间维度
         tilesize = self.spmv_sim.tilesize
-        self.state_dim = tilesize + 1  # sub_p + iteration
+        num_tiles = (self.matrix_size + tilesize - 1) // tilesize  # 向上取整计算 tile 数量
+        # 计算实际状态维度：考虑最后一个 tile 可能不是完整 tilesize
+        self.state_dim = num_tiles * (tilesize + 1)   # 每个 tile 的状态维度 = tilesize + 1（迭代索引）
 
     def _load_matrix_info(self) -> Dict[str, Any]:
         """
@@ -163,6 +168,10 @@ class CGEnvironment:
         Returns:
             (A_diagonal, b) - 对角线元素和右端项
         """
+        if self.matrix_loaded:
+            # 矩阵已加载，直接返回缓存的数据
+            return self.A_diagonal, self.b
+
         if self.matrix_name is not None:
             # 加载真实的矩阵
             try:
@@ -179,6 +188,8 @@ class CGEnvironment:
 
                 # 将矩阵转换为我们的 SparseMatrix 格式
                 self.A_sparse = self._csr_to_sparse_matrix(self.A_matrix)
+
+                self.matrix_loaded = True
 
             except Exception as e:
                 print(f"Failed to load matrix '{self.matrix_name}': {e}")
@@ -207,6 +218,12 @@ class CGEnvironment:
         # 生成右端项 b
         b = [random.gauss(0, 1) for _ in range(self.matrix_size)]
 
+        # 为随机矩阵创建稀疏矩阵表示（对角矩阵）
+        self.A_sparse = SparseMatrix(self.matrix_size, self.matrix_size)
+        for i in range(self.matrix_size):
+            self.A_sparse.add_element(i, i, A_diagonal[i])
+
+        self.matrix_loaded = True
         return A_diagonal, b
 
     def _csr_to_sparse_matrix(self, csr_mat) -> SparseMatrix:
@@ -319,6 +336,25 @@ class CGEnvironment:
                     features[:len(sub_p)] = [(v - vec_mean) / vec_std for v in vector_part]
 
         return features
+    
+    def get_state_features(self, p: List[float], iteration: int) -> List[float]:
+        """
+        获取状态特征向量
+        """
+        # 返回所有 tiles 的状态
+        tilesize = self.spmv_sim.tilesize
+        num_tiles = (self.matrix_size + tilesize - 1) // tilesize
+        state = []
+        for tile_idx in range(num_tiles):
+            start_idx = tile_idx * tilesize
+            end_idx = start_idx + tilesize
+            sub_p = self.p[start_idx:end_idx]
+            # 如果最后一个 tile 不足 tilesize，则补0
+            if len(sub_p) < tilesize:
+                sub_p += [0.0] * (tilesize - len(sub_p))
+            tile_state = self._extract_state_features(sub_p, self.current_iteration)
+            state.extend(tile_state)
+        return state
 
     def reset(self, seed: Optional[int] = None) -> List[float]:
         """
@@ -358,20 +394,15 @@ class CGEnvironment:
         self.episode_cpt_cost = 0.0
         self.tile_actions = []
         self.step_rewards = []
+        
+        return self.get_state_features(self.p, self.current_iteration)
 
-        # 返回第一个 tile 的状态
-        tilesize = self.spmv_sim.tilesize
-        sub_p = self.p[:tilesize]
-        state = self._extract_state_features(sub_p, self.current_iteration)
-
-        return state
-
-    def step(self, action: int) -> Tuple[List[float], float, bool, Dict]:
+    def step(self, actions: List[int]) -> Tuple[List[float], float, bool, Dict]:
         """
-        执行一步：选择一个 tile 的精度
+        执行一步：为当前迭代的所有 tiles 选择精度，完成一次完整的 CG 迭代
 
         Args:
-            action: 精度选择动作 (0-5)
+            actions: 精度选择动作列表，每个元素对应一个 tile 的精度 (0-5)
 
         Returns:
             (next_state, reward, done, info)
@@ -380,89 +411,86 @@ class CGEnvironment:
             raise RuntimeError("Episode 已结束，请调用 reset()")
 
         tilesize = self.spmv_sim.tilesize
-        num_tiles = self.matrix_size // tilesize
-        
-        episode_reward = 0
+        num_tiles = (self.matrix_size + tilesize - 1) // tilesize  # 向上取整计算 tile 数量
 
-        # 记录当前 tile 的动作
-        self.tile_actions.append(action)
+        # 验证 actions 的长度
+        if len(actions) != num_tiles:
+            raise ValueError(f"actions 长度 {len(actions)} 与 tile 数量 {num_tiles} 不匹配")
 
-        # 获取当前 tile 的子向量和矩阵块
-        start_idx = self.current_tile_idx * tilesize
-        # 最后一个tile的大小可能小于tilesize
-        actual_tilesize = min(tilesize, self.matrix_size - start_idx)
-        end_idx = start_idx + actual_tilesize
-        sub_p = self.p[start_idx:end_idx]
+        # 记录当前迭代的所有 tile 动作
+        self.tile_actions = actions.copy()
 
-        # 提取当前 tile 的矩阵块
-        matrix_block = self._extract_matrix_block(start_idx, end_idx)
+        # 初始化 Ap 向量
+        self.Ap = [0.0] * self.matrix_size
+        iteration_cost = 0.0
 
-        # 模拟该 tile 的 SpMV 计算
-        partial_result, cpt_cost = self.spmv_sim.simulate_spmv_block(matrix_block, self.p, action)
-        
+        # 为当前迭代的所有 tiles 执行 SpMV 计算
+        for tile_idx in range(num_tiles):
+            start_idx = tile_idx * tilesize
+            actual_tilesize = min(tilesize, self.matrix_size - start_idx)
+            end_idx = start_idx + actual_tilesize
 
-        # 累加到 Ap 向量
-        if self.Ap is None:
-            self.Ap = [0.0] * self.matrix_size
-        for i in range(actual_tilesize):
-            self.Ap[start_idx + i] += partial_result[i]
-            
-        self.current_tile_idx += 1
+            # 提取当前 tile 的矩阵块
+            matrix_block = self._extract_matrix_block(start_idx, end_idx)
 
-        # 累加计算成本
-        self.episode_cpt_cost += cpt_cost
+            # 模拟该 tile 的 SpMV 计算
+            action = actions[tile_idx]
+            partial_result, cpt_cost = self.spmv_sim.simulate_spmv_block(matrix_block, self.p, action)
 
-        # 检查是否完成当前迭代的所有 tiles
-        done = False
-        if self.current_tile_idx >= num_tiles:
-            # 完成一次 CG 迭代
-            converged, residual_norm, iter_done = self._complete_cg_iteration()
-            
-            # 计算当前 episode 的奖励
-            episode_reward = self.w1 * (-math.log(residual_norm/self.b_norm, 10)) - self.w2 * (self.episode_cpt_cost/num_tiles) + self.w3 * converged
-            
-            print("")
-            print("================================================")
-            print(f"当前迭代次数: {self.current_iteration}")
-            print(f"当前迭代残差: {residual_norm}")
-            print(f"当前迭代每tile平均计算成本: {self.episode_cpt_cost/num_tiles}")
-            print(f"当前迭代是否收敛: {converged}")
-            print(f"残差下降奖励: {self.w1 * (-math.log(residual_norm/self.b_norm, 10))}")
-            print(f"计算成本奖励: {-self.w2 * (self.episode_cpt_cost/num_tiles)}")
-            print(f"收敛奖励: {self.w3 * converged}")
-            print(f"总奖励: {episode_reward}")
-            
-            if not iter_done:
-                # 开始新的迭代
-                self.current_iteration += 1
-                self.current_tile_idx = 0
-                self.tile_actions = []
-                self.episode_cpt_cost = 0
-                
-                if self.current_iteration >= self.max_iter:
-                    iter_done = True
-            done = iter_done
+            # 累加到 Ap 向量
+            for i in range(actual_tilesize):
+                self.Ap[start_idx + i] += partial_result[i]
 
-        self.step_rewards.append(episode_reward)
+            # 累加计算成本
+            iteration_cost += cpt_cost
+
+        # 累加到 episode 总成本
+        self.episode_cpt_cost += iteration_cost
+
+        # 完成一次 CG 迭代
+        converged, residual_norm, iter_done = self._complete_cg_iteration()
+
+        # 计算当前迭代的奖励
+        iteration_reward = self.w1 * (-math.log(residual_norm/self.b_norm, 10)) - self.w2 * (iteration_cost/num_tiles) + self.w3 * converged
+
+        print("")
+        print("================================================")
+        print(f"当前迭代次数: {self.current_iteration}")
+        print(f"当前迭代残差: {residual_norm}")
+        print(f"当前迭代每tile平均计算成本: {iteration_cost/num_tiles}")
+        print(f"当前迭代是否收敛: {converged}")
+        print(f"残差下降奖励: {self.w1 * (-math.log(residual_norm/self.b_norm, 10))}")
+        print(f"计算成本奖励: {-self.w2 * (iteration_cost/num_tiles)}")
+        print(f"收敛奖励: {self.w3 * converged}")
+        print(f"总奖励: {iteration_reward}")
+
+        # 检查是否结束
+        done = iter_done
+        if not iter_done:
+            # 开始新的迭代
+            self.current_iteration += 1
+            if self.current_iteration >= self.max_iter:
+                done = True
+
+        self.step_rewards.append(iteration_reward)
 
         # 准备下一个状态
         if not done:
-            next_start_idx = self.current_tile_idx * tilesize
-            next_actual_tilesize = min(tilesize, self.matrix_size - next_start_idx)
-            next_end_idx = next_start_idx + next_actual_tilesize
-            next_sub_p = self.p[next_start_idx:next_end_idx]
-            next_state = self._extract_state_features(next_sub_p, self.current_iteration)
+            # 为下一个迭代的所有 tiles 提取状态
+            next_state = self.get_state_features(self.p, self.current_iteration)
         else:
             next_state = []
 
         info = {
-            'tile_idx': self.current_tile_idx - 1,
             'iteration': self.current_iteration,
-            'cpt_cost': cpt_cost,
+            'iteration_cost': iteration_cost,
             'episode_cost': self.episode_cpt_cost,
+            'tile_actions': self.tile_actions.copy(),
+            'converged': converged,
+            'residual_norm': residual_norm
         }
 
-        return next_state, episode_reward, done, info
+        return next_state, iteration_reward, done, info
 
     def _complete_cg_iteration(self) -> Tuple[float, bool]:
         """
