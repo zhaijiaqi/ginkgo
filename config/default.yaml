@@ -1,0 +1,50 @@
+cg:
+  max_iter: 100
+  stop_tol: 1e-10
+  matrix_size: 1024  # 矩阵大小 (n x n)，当使用真实矩阵时会被覆盖
+  matrix_name: Muu  # 矩阵名称，从 matrix_set.csv 中选择
+  matrix_data_dir: ~/data/matrix  # 矩阵数据目录
+  matrix_set_csv: matrix_set.csv  # 矩阵信息CSV文件
+
+spmv:
+  tilesize: 32
+  precision_cost_table:
+    fp64: 1.0
+    fp32: 0.7
+    tf32: 0.55
+    fp16: 0.35
+    bf16: 0.33
+    fp8: 0.15
+  error_coeff_table:
+    fp64: 1e-15
+    fp32: 1e-7
+    tf32: 1e-4
+    fp16: 1e-3
+    bf16: 5e-4
+    fp8: 1e-2
+
+reward:
+  type: weighted
+  w1: 2.0  # 数值误差奖励权重
+  w2: 0.1  # 计算成本奖励权重
+  w3: 10.0 # 收敛性奖励权重
+
+ppo:
+  gamma: 0.99
+  learning_rate: 3e-4
+  n_epochs: 10
+  batch_size: 64
+  clip_range: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+
+train:
+  total_steps: 100000
+  eval_interval: 5000
+  save_interval: 10000
+  log_interval: 1000
+  num_envs: 1
+
+env:
+  normalize_state: true
+  reward_at_each_iter: false  # 是否在每次CG迭代后发放奖励
