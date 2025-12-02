@@ -29,7 +29,7 @@ class CGEnvironment:
     CG (Conjugate Gradient) 强化学习环境
 
     每个 episode 对应一次完整的 CG 求解过程
-    每个 step 对应一个 tile 的精度选择决策
+    每个 step 对应一次 tile 粒度精度选择的 CG 迭代
     """
 
     def __init__(self, config: Dict):
@@ -63,7 +63,6 @@ class CGEnvironment:
         spmv_config = {
             'tilesize': config.get('tilesize', 32),
             'precision_cost_table': config.get('precision_cost_table'),
-            'error_coeff_table': config.get('error_coeff_table'),
             'random_seed': config.get('random_seed', 42)
         }
         self.math_sim = CGMathSimulator()
@@ -503,16 +502,16 @@ class CGEnvironment:
         r_dot_r = self.math_sim.vector_dot(self.r, self.r)
         p_dot_Ap = self.math_sim.vector_dot(self.p, self.Ap)
 
-        if p_dot_Ap <= 1e-20:  # 使用更小的阈值来检测数值问题
-            # Ap 与 p 不正交或数值不稳定，算法发散
-            return -self.w3, True
+        # if p_dot_Ap <= 1e-20:  # 使用更小的阈值来检测数值问题
+        #     # Ap 与 p 不正交或数值不稳定，算法发散
+        #     return -self.w3, True
 
         alpha = r_dot_r / p_dot_Ap
 
         # 添加数值稳定性检查：防止alpha过大导致的数值爆炸
-        if abs(alpha) > 1e6:
-            # alpha过大，可能是数值不稳定
-            return -self.w3, True
+        # if abs(alpha) > 1e6:
+        #     # alpha过大，可能是数值不稳定
+        #     return -self.w3, True
 
         # 更新解: x = x + alpha * p
         alpha_p = self.math_sim.vector_scale(alpha, self.p)

@@ -127,7 +127,7 @@ class PPOAgentFactory:
             lambd=self.config.get('lambda', 0.95),  # GAE lambda
             phi=lambda x: x.astype(np.float32, copy=False),  # 状态预处理
             value_func_coef=self.config.get('value_coef', 0.5),
-            entropy_coeff=self.config.get('entropy_coef', 0.01),
+            entropy_coef=self.config.get('entropy_coef', 0.01),
             update_interval=self.config.get('update_interval', 2048),
             minibatch_size=self.config.get('minibatch_size', 64),
             epochs=self.config.get('n_epochs', 10),
@@ -167,60 +167,3 @@ class PPOAgentFactory:
             'standardize_advantages': ppo_config.get('standardize_advantages', True),
             'act_deterministically': ppo_config.get('act_deterministically', False),
         }
-
-
-def test_ppo_agent_factory():
-    """测试 PPO Agent Factory"""
-    print("=== PPO Agent Factory 测试 ===")
-
-    # 测试模型创建
-    state_dim = 8
-    action_size = 6
-    hidden_sizes = (32, 32)
-
-    model = create_cg_model(state_dim, action_size, hidden_sizes)
-
-    print(f"状态维度: {state_dim}")
-    print(f"动作空间大小: {action_size}")
-    print(f"模型结构: {model}")
-
-    # 测试前向传播
-    test_state = torch.randn(state_dim).unsqueeze(0)  # 添加 batch 维度
-    with torch.no_grad():
-        policy_output, value_output = model(test_state)
-        print(f"策略输出形状: {policy_output.shape}")
-        print(f"价值输出形状: {value_output.shape}")
-
-    print("✓ PPO Agent Factory 模型创建测试通过")
-
-    # 尝试创建 PPO 代理
-    try:
-        config = {
-            'learning_rate': 3e-4,
-            'gamma': 0.99,
-            'minibatch_size': 64,
-            'epochs': 10,
-            'clip_eps': 0.2,
-            'value_coef': 0.5,
-            'entropy_coef': 0.01,
-            'gpu': -1,
-        }
-
-        factory = PPOAgentFactory(config)
-        agent = factory.create_agent(state_dim, action_size)
-        print("✓ PPO Agent 创建成功")
-
-        # 测试基本功能
-        test_obs = np.random.randn(state_dim).astype(np.float32)
-        action = agent.act(test_obs)
-        print(f"测试动作选择: {action}")
-
-    except Exception as e:
-        print(f"⚠ PPO Agent 创建失败: {e}")
-        print("注意: PPO 代理测试失败，但模型创建成功")
-
-    print("✓ PPO Agent Factory 测试完成")
-
-
-if __name__ == "__main__":
-    test_ppo_agent_factory()

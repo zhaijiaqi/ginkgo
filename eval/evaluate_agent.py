@@ -340,10 +340,6 @@ def main():
             'fp64': 1.0, 'fp32': 0.7, 'tf32': 0.55,
             'fp16': 0.35, 'bf16': 0.33, 'fp8': 0.15
         }),
-        'error_coeff_table': config.get('spmv', {}).get('error_coeff_table', {
-            'fp64': 1e-15, 'fp32': 1e-7, 'tf32': 1e-4,
-            'fp16': 1e-3, 'bf16': 5e-4, 'fp8': 1e-2
-        }),
         'reward': config.get('reward'),
         'normalize_state': config.get('env', {}).get('normalize_state', True)
     }
@@ -394,10 +390,6 @@ if __name__ == "__main__":
             'precision_cost_table': config.get('spmv', {}).get('precision_cost_table', {
                 'fp64': 1.0, 'fp32': 0.7, 'tf32': 0.55,
                 'fp16': 0.35, 'bf16': 0.33, 'fp8': 0.15
-            }),
-            'error_coeff_table': config.get('spmv', {}).get('error_coeff_table', {
-                'fp64': 1e-15, 'fp32': 1e-7, 'tf32': 1e-4,
-                'fp16': 1e-3, 'bf16': 5e-4, 'fp8': 1e-2
             }),
             'reward': config.get('reward'),
             'normalize_state': config.get('env', {}).get('normalize_state', True)
