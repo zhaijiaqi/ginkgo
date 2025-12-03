@@ -480,7 +480,7 @@ class CGEnvironment:
             # 为下一个迭代的所有 tiles 提取状态
             next_state = self.get_state_features(self.p, self.current_iteration)
         else:
-            next_state = []
+            next_state = self.reset()
 
         info = {
             'iteration': self.current_iteration,
