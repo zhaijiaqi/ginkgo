@@ -1,8 +1,8 @@
 cg:
-  max_iter: 100
-  stop_tol: 1e-6
-  matrix_size: 1024  # 矩阵大小 (n x n)，当使用真实矩阵时会被覆盖
-  matrix_name: Muu  # 矩阵名称，从 matrix_set.csv 中选择， rajat05 比较小
+  max_iter: 30
+  stop_tol: 1e-5
+  matrix_size: 256  # 矩阵大小 (n x n)，当使用真实矩阵时会被覆盖
+  matrix_name: none  # 矩阵名称，从 matrix_set.csv 中选择， rajat05 比较小，但不适用于cg，muu适用于cg，但比较大
   matrix_data_dir: ~/data/matrix  # 矩阵数据目录
   matrix_set_csv: matrix_set.csv  # 矩阵信息CSV文件
 
@@ -34,10 +34,10 @@ ppo:
   update_interval: 10
 
 train:
-  total_steps: 1000
-  eval_interval: 50
-  save_interval: 100
-  log_interval: 100
+  total_steps: 10000
+  eval_interval: 500
+  save_interval: 1000
+  log_interval: 1000
   num_envs: 1
 
 env:

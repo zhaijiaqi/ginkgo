@@ -76,6 +76,9 @@ class CGEnvironment:
         self.current_tile_idx = 0
         self.episode_done = False
 
+        # 保存上一个episode的信息（用于评估钩子获取）
+        self.last_episode_info = None
+
         # CG 变量
         self.x = None  # 解向量
         self.r = None  # 残差向量
@@ -97,6 +100,10 @@ class CGEnvironment:
         self.episode_cpt_cost = 0.0
         self.tile_actions = []  # 当前迭代的所有 tile 动作
         self.step_rewards = []  # 每步奖励
+
+        # 最后一步信息（用于钩子访问）
+        self.last_reward = 0.0
+        self.last_info = {}
 
         # 性能分析
         self.performance_stats = {
@@ -423,6 +430,11 @@ class CGEnvironment:
         Returns:
             初始状态特征向量
         """
+        # 在重置之前，保存当前episode的信息（如果有数据）
+        if (hasattr(self, 'residual_tracker') and self.residual_tracker.residual_history and
+            (self.episode_cpt_cost > 0 or self.step_rewards)):
+            self.last_episode_info = self.get_episode_info()
+
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
@@ -452,6 +464,10 @@ class CGEnvironment:
         self.episode_cpt_cost = 0.0
         self.tile_actions = []
         self.step_rewards = []
+
+        # 重置最后一步信息
+        self.last_reward = 0.0
+        self.last_info = {}
 
         # 重置性能统计
         self.performance_stats = {
@@ -562,11 +578,18 @@ class CGEnvironment:
             self.performance_stats['cache_hits'] = self.spmv_sim._cache_hit_count
             self.performance_stats['cache_misses'] = self.spmv_sim._cache_miss_count
 
+        # 标记episode结束
+        if done:
+            self.episode_done = True
+
         # 准备下一个状态
         if not done:
             # 为下一个迭代的所有 tiles 提取状态
             next_state = self.get_state_features(self.p, self.current_iteration)
         else:
+            # episode结束，返回重置后的状态
+            # 注意：在评估模式下，pfrl会在评估钩子之后才调用reset，
+            # 所以评估钩子应该能在reset之前获取episode信息
             next_state = self.reset()
 
         info = {
@@ -578,6 +601,10 @@ class CGEnvironment:
             'residual_norm': residual_norm,
             'performance_stats': self.performance_stats.copy()
         }
+
+        # 保存最后一步信息供钩子访问
+        self.last_reward = iteration_reward
+        self.last_info = info.copy()
 
         return next_state, iteration_reward, done, info
 
@@ -655,16 +682,40 @@ class CGEnvironment:
         Returns:
             episode 统计信息字典
         """
+        # 如果当前episode数据已被重置，尝试从last_episode_info获取
+        if (not hasattr(self, 'residual_tracker') or 
+            not self.residual_tracker.residual_history or
+            (self.episode_cpt_cost == 0 and not self.step_rewards)):
+            if hasattr(self, 'last_episode_info') and self.last_episode_info:
+                return self.last_episode_info.copy()
+
         convergence_info = self.residual_tracker.get_convergence_info()
 
+        # 确保residual_history包含所有记录的残差值
+        residual_history = convergence_info.get('residual_history', [])
+        if not residual_history and convergence_info.get('initial_residual') is not None:
+            # 如果history为空但initial_residual存在，至少包含初始残差
+            residual_history = [convergence_info['initial_residual']]
+            if convergence_info.get('final_residual') is not None:
+                residual_history.append(convergence_info['final_residual'])
+
+        # 计算收敛状态：如果final_residual存在且小于容忍度，则收敛
+        final_residual = convergence_info.get('final_residual')
+        converged = 1 if (final_residual is not None and final_residual < self.stop_tol) else 0
+
+        # 确保total_cost和avg_tile_cost正确计算
+        total_cost = self.episode_cpt_cost if self.episode_cpt_cost > 0 else 0.0
+        num_steps = len(self.step_rewards) if self.step_rewards else 1
+        avg_tile_cost = total_cost / max(1, num_steps)
+
         return {
-            'iterations': convergence_info['iterations'],
-            'final_residual': convergence_info['final_residual'],
-            'initial_residual': convergence_info['initial_residual'],
-            'convergence_ratio': convergence_info['convergence_ratio'],
-            'converged': convergence_info['final_residual'] < self.stop_tol if convergence_info['final_residual'] else False,
-            'total_cost': self.episode_cpt_cost,
-            'avg_tile_cost': self.episode_cpt_cost / max(1, len(self.step_rewards)),
-            'residual_history': convergence_info['residual_history'],
-            'step_rewards': self.step_rewards.copy()
+            'iterations': convergence_info.get('iterations', 0),
+            'final_residual': final_residual,
+            'initial_residual': convergence_info.get('initial_residual'),
+            'convergence_ratio': convergence_info.get('convergence_ratio'),
+            'converged': converged,  # 使用0/1而不是False/True
+            'total_cost': total_cost,
+            'avg_tile_cost': avg_tile_cost,
+            'residual_history': residual_history,
+            'step_rewards': self.step_rewards.copy() if self.step_rewards else []
         }

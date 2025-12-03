@@ -15,6 +15,7 @@ import json
 from datetime import datetime
 import matplotlib.pyplot as plt
 import pfrl
+import time
 
 
 # 导入项目模块
@@ -112,7 +113,7 @@ def train_cg_ppo(config: Dict):
             env=env,
             steps=train_params['total_steps'],
             eval_n_steps=None,  # 不限制每次评估的步数
-            eval_n_episodes=1,  # 每次评估运行1个episode
+            eval_n_episodes=2,  # 每次评估运行1个episode
             eval_interval=train_params['eval_interval'],
             outdir=log_dir,
             checkpoint_freq=train_params['save_interval'],  # 定期保存检查点
@@ -167,4 +168,7 @@ def main():
 
 
 if __name__ == "__main__":
+    time_start = time.time()
     main()
+    time_end = time.time()
+    print(f"训练时间: {time_end - time_start} 秒")
