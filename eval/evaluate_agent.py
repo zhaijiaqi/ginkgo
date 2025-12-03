@@ -16,57 +16,12 @@ import argparse
 
 # 导入项目模块
 from env.cg_env import CGEnvironment
-from agent.ppo_agent_factory import create_cg_model
-
-
-class MockPPOAgent:
-    """
-    模拟 PPO 代理，用于加载和评估训练好的模型
-    """
-
-    def __init__(self, state_dim: int, action_size: int, model_path: Optional[str] = None):
-        self.state_dim = state_dim
-        self.action_size = action_size
-        self.model = create_cg_model(state_dim, action_size, (64, 64))
-
-        if model_path and os.path.exists(model_path):
-            self.load(model_path)
-
-    def act(self, obs: np.ndarray, deterministic: bool = True) -> int:
-        """
-        选择动作
-
-        Args:
-            obs: 观测状态
-            deterministic: 是否使用确定性策略 (选择概率最高的动作)
-        """
-        with torch.no_grad():
-            obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
-            logits, _ = self.model(obs_tensor)
-
-            if deterministic:
-                return torch.argmax(logits, dim=-1).item()
-            else:
-                probs = torch.softmax(logits, dim=-1).squeeze(0)
-                return torch.multinomial(probs, 1).item()
-
-    def load(self, path: str):
-        """加载模型"""
-        self.model.load_state_dict(torch.load(path))
-        self.model.eval()
-
-    def get_action_probabilities(self, obs: np.ndarray) -> np.ndarray:
-        """获取所有动作的概率"""
-        with torch.no_grad():
-            obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
-            logits, _ = self.model(obs_tensor)
-            probs = torch.softmax(logits, dim=-1).squeeze(0)
-            return probs.numpy()
+from agent.ppo_agent_factory import PPOAgentFactory, CGPPOAgent
 
 
 def evaluate_agent_performance(
     env: CGEnvironment,
-    agent: MockPPOAgent,
+    agent: CGPPOAgent,
     num_episodes: int = 100,
     deterministic: bool = True
 ) -> Dict[str, Any]:
@@ -345,11 +300,17 @@ def main():
     }
     env = CGEnvironment(env_config)
 
-    state_dim = env.get_state_dim()
-    action_size = env.get_action_space_size()
+    # 创建 PPO Agent Factory
+    ppo_factory = PPOAgentFactory(config)
 
-    # 创建代理并加载模型
-    agent = MockPPOAgent(state_dim, action_size, args.model_path)
+    # 创建代理实例并加载模型
+    # 注意：这里我们使用环境的状态维度和动作空间大小来创建代理
+    # 如果模型是使用不同的维度训练的，这可能会导致问题
+    agent = ppo_factory.create_agent(env.get_state_dim(), env.get_action_space_size())
+
+    # 加载训练好的模型
+    if args.model_path and os.path.exists(args.model_path):
+        agent.load(args.model_path)
 
     # 评估
     eval_results = evaluate_agent_performance(
@@ -396,8 +357,9 @@ if __name__ == "__main__":
         }
         env = CGEnvironment(env_config)
 
-        # 创建随机代理进行测试
-        agent = MockPPOAgent(env.get_state_dim(), env.get_action_space_size())
+        # 创建 PPO Agent Factory 并创建随机代理进行测试
+        ppo_factory = PPOAgentFactory(config)
+        agent = ppo_factory.create_agent(env.get_state_dim(), env.get_action_space_size())
 
         # 评估
         eval_results = evaluate_agent_performance(env, agent, num_episodes=10)

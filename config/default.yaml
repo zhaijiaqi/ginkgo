@@ -1,5 +1,5 @@
 cg:
-  max_iter: 100
+  max_iter: 10
   stop_tol: 1e-10
   matrix_size: 1024  # 矩阵大小 (n x n)，当使用真实矩阵时会被覆盖
   matrix_name: rajat05  # 矩阵名称，从 matrix_set.csv 中选择， rajat05 比较小
@@ -34,10 +34,10 @@ ppo:
   update_interval: 10
 
 train:
-  total_steps: 1000
-  eval_interval: 50
-  save_interval: 100
-  log_interval: 100
+  total_steps: 100
+  eval_interval: 5
+  save_interval: 10
+  log_interval: 10
   num_envs: 1
 
 env:

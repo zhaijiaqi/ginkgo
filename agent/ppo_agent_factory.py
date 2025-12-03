@@ -12,6 +12,15 @@ from typing import Dict, Any, Optional, List
 import os
 import logging
 
+from models import create_cg_model
+
+
+# 为了向后兼容，保留这个函数
+def create_cg_model(state_dim: int, action_size: int, hidden_sizes=(64, 64)):
+    """创建CG模型的向后兼容函数"""
+    from models.cg_model import create_cg_model as _create_cg_model
+    return _create_cg_model(state_dim, action_size, hidden_sizes)
+
 
 class CGPPOAgent:
     """
