@@ -114,6 +114,7 @@ class TrainingLogger:
         axes[1, 1].set_ylabel('Reward')
 
         plt.tight_layout()
+        print(f"saving training curves to {os.path.join(self.log_dir, 'training_curves.png')}")
         plt.savefig(os.path.join(self.log_dir, 'training_curves.png'))
         plt.close()
 
@@ -229,6 +230,7 @@ def train_cg_ppo(config: Dict):
         )
 
         print("pfrl 训练完成!")
+        print(f"评估统计历史记录了 {len(eval_stats_history)} 次评估")
 
     except Exception as e:
         import traceback
@@ -241,8 +243,30 @@ def train_cg_ppo(config: Dict):
     logger.save_stats()
     logger.plot_training_curves()
 
+    # 保存评估统计历史
+    def convert_to_serializable(obj):
+        """将numpy数据类型转换为JSON可序列化的Python原生类型"""
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {key: convert_to_serializable(value) for key, value in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [convert_to_serializable(item) for item in obj]
+        else:
+            return obj
+
+    eval_stats_path = os.path.join(log_dir, 'eval_stats_history.json')
+    with open(eval_stats_path, 'w') as f:
+        serializable_stats = convert_to_serializable(eval_stats_history)
+        json.dump(serializable_stats, f, indent=2)
+    print(f"评估统计历史保存至: {eval_stats_path}")
+
     final_model_path = os.path.join(log_dir, 'final_model.pt')
-    agent.save(final_model_path)
+    trained_agent.save(final_model_path)  # 使用训练后的代理保存模型
 
     print(f"训练完成! 最终模型保存至: {final_model_path}")
     print(f"训练日志保存至: {log_dir}")

@@ -23,22 +23,20 @@ class CGPPOAgent:
         self.num_tiles = num_tiles
         self.tile_state_dim = tile_state_dim
         self.action_size = action_size
+
+        # 创建共享的模型（单个tile的状态维度）
+        shared_model = self._create_single_tile_model(tile_state_dim, action_size)
+
+        # 创建多个代理实例，但共享相同的模型参数
         self.tile_agents = []
-
-        # 为每个tile创建独立的PPO代理
         for _ in range(num_tiles):
-            # 创建单个tile的模型
-            model = self._create_single_tile_model(tile_state_dim, action_size)
-
             # 创建PPO代理的参数
             agent_kwargs = ppo_kwargs.copy()
-            agent_kwargs['model'] = model
-            # 为每个子代理创建独立的optimizer
-            agent_kwargs['optimizer'] = torch.optim.Adam(model.parameters(), lr=ppo_kwargs.get('lr', 3e-4))
-            # 移除PPO不接受的参数
+            agent_kwargs['model'] = shared_model  # 所有代理共享同一个模型
+            agent_kwargs['optimizer'] = torch.optim.Adam(shared_model.parameters(), lr=ppo_kwargs.get('lr', 3e-4))
             agent_kwargs.pop('lr', None)
 
-            # 创建子代理
+            # 创建代理实例
             agent = PPO(**agent_kwargs)
             self.tile_agents.append(agent)
 
@@ -101,7 +99,7 @@ class CGPPOAgent:
         return model
 
     def act(self, obs):
-        """为每个tile独立选择动作"""
+        """为每个tile独立选择动作（参数共享的代理）"""
         actions = []
 
         for tile_idx in range(self.num_tiles):
@@ -110,47 +108,46 @@ class CGPPOAgent:
             end_idx = start_idx + self.tile_state_dim
             tile_obs = obs[start_idx:end_idx]
 
-            # 使用对应的子代理选择动作
+            # 使用对应代理为当前tile选择动作
             action = self.tile_agents[tile_idx].act(tile_obs)
             actions.append(action)
 
         return actions
 
     def observe(self, obs, reward, done, reset):
-        """观察多tile环境的转换"""
-        # 为每个子代理调用observe
+        """观察多tile环境的转换（参数共享的代理）"""
+        # 为每个代理调用observe，每个代理观察对应tile的状态
         for tile_idx in range(self.num_tiles):
             # 提取当前tile的状态
             start_idx = tile_idx * self.tile_state_dim
             end_idx = start_idx + self.tile_state_dim
             tile_obs = obs[start_idx:end_idx] if len(obs) > 0 else obs
 
-            # 为子代理调用observe
+            # 为对应代理调用observe
             self.tile_agents[tile_idx].observe(tile_obs, reward, done, reset)
 
     def save(self, path: str):
-        """保存所有tile的模型"""
+        """保存参数共享的代理模型"""
         import os
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        # 保存所有子代理
+        # 保存参数共享的代理
         saved_data = {
             'num_tiles': self.num_tiles,
             'tile_state_dim': self.tile_state_dim,
             'action_size': self.action_size,
         }
 
-        for i, agent in enumerate(self.tile_agents):
-            agent_path = f"{path}_tile_{i}"
-            agent.save(agent_path)
-            saved_data[f'tile_{i}_path'] = agent_path
+        # 保存第一个代理（所有代理共享相同模型，所以只需要保存一个）
+        self.tile_agents[0].save(path + "_shared")
+        saved_data['shared_agent_path'] = path + "_shared"
 
         # 保存元数据
         import torch
         torch.save(saved_data, path)
 
     def load(self, path: str):
-        """加载所有tile的模型"""
+        """加载参数共享的代理模型"""
         import torch
         saved_data = torch.load(path)
 
@@ -159,10 +156,9 @@ class CGPPOAgent:
         assert saved_data['tile_state_dim'] == self.tile_state_dim
         assert saved_data['action_size'] == self.action_size
 
-        # 加载每个子代理
-        for i in range(self.num_tiles):
-            agent_path = saved_data[f'tile_{i}_path']
-            self.tile_agents[i].load(agent_path)
+        # 加载共享模型（加载到一个代理，然后所有代理都会共享相同的参数）
+        agent_path = saved_data['shared_agent_path']
+        self.tile_agents[0].load(agent_path)
 
     def eval_mode(self):
         """切换到评估模式"""
@@ -296,24 +292,22 @@ class PfrlCompatibleCGPPOAgent:
 
     def get_statistics(self):
         """获取统计信息"""
-        # 收集所有子代理的统计信息
-        merged_stats = {}
-        for i, tile_agent in enumerate(self.cg_ppo_agent.tile_agents):
-            try:
-                stats = tile_agent.get_statistics()
-                # pfrl 返回的是列表，转换为字典
-                if isinstance(stats, list):
-                    for j, stat in enumerate(stats):
-                        merged_stats[f"tile_{i}_stat_{j}"] = stat
-                elif isinstance(stats, dict):
-                    for key, value in stats.items():
-                        merged_stats[f"tile_{i}_{key}"] = value
-                else:
-                    merged_stats[f"tile_{i}_stats"] = stats
-            except Exception as e:
-                self.logger.warning(f"无法获取 tile {i} 的统计信息: {e}")
-
-        return merged_stats
+        # 获取第一个代理的统计信息（所有代理共享相同模型）
+        try:
+            stats = self.cg_ppo_agent.tile_agents[0].get_statistics()
+            # pfrl 返回的是列表，转换为字典
+            if isinstance(stats, list):
+                merged_stats = {}
+                for j, stat in enumerate(stats):
+                    merged_stats[f"shared_stat_{j}"] = stat
+                return merged_stats
+            elif isinstance(stats, dict):
+                return stats
+            else:
+                return {"shared_stats": stats}
+        except Exception as e:
+            self.logger.warning(f"无法获取共享代理的统计信息: {e}")
+            return {}
 
     def eval_mode(self):
         """切换到评估模式，返回上下文管理器"""
@@ -337,7 +331,7 @@ class PfrlCompatibleCGPPOAgent:
     @property
     def training(self):
         """是否处于训练模式"""
-        # 返回第一个子代理的训练状态（假设所有子代理状态一致）
+        # 返回第一个代理的训练状态（所有代理状态应该一致）
         return self.cg_ppo_agent.tile_agents[0].training if self.cg_ppo_agent.tile_agents else False
 
     @property
