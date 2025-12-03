@@ -416,6 +416,8 @@ class CGEnvironment:
         if len(actions) != num_tiles:
             raise ValueError(f"actions 长度 {len(actions)} 与 tile 数量 {num_tiles} 不匹配")
 
+        print([int(a) for a in actions])
+        
         # 记录当前迭代的所有 tile 动作
         self.tile_actions = actions.copy()
 

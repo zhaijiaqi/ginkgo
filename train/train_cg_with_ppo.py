@@ -18,80 +18,80 @@ import matplotlib.pyplot as plt
 
 # 导入项目模块
 from env.cg_env import CGEnvironment
-from agent.ppo_agent_factory import PPOAgentFactory, create_cg_model
+from agent.ppo_agent_factory import PPOAgentFactory, CGPPOAgent
 
 
-class MockPPOAgent:
-    """
-    模拟 PPO 代理，用于测试训练流程
-    在真实实现中，这将被替换为真正的 pfrl PPO 代理
-    """
+# class MockPPOAgent:
+#     """
+#     模拟 PPO 代理，用于测试训练流程
+#     在真实实现中，这将被替换为真正的 pfrl PPO 代理
+#     """
 
-    def __init__(self, state_dim: int, action_size: int, tilesize: int = 32):
-        self.state_dim = state_dim
-        self.action_size = action_size
-        self.tilesize = tilesize
+#     def __init__(self, state_dim: int, action_size: int, tilesize: int = 32):
+#         self.state_dim = state_dim
+#         self.action_size = action_size
+#         self.tilesize = tilesize
 
-        # 计算单个 tile 的状态维度
-        self.tile_state_dim = tilesize + 1
-        self.num_tiles = state_dim // self.tile_state_dim
+#         # 计算单个 tile 的状态维度
+#         self.tile_state_dim = tilesize + 1
+#         self.num_tiles = state_dim // self.tile_state_dim
 
-        # 创建共享模型，所有 tile 使用同一个模型
-        self.model = create_cg_model(self.tile_state_dim, action_size, (64, 64))
+#         # 创建共享模型，所有 tile 使用同一个模型
+#         self.model = create_cg_model(self.tile_state_dim, action_size, (64, 64))
 
-        # 简单的 epsilon-greedy 策略
-        self.epsilon = 0.1
+#         # 简单的 epsilon-greedy 策略
+#         self.epsilon = 0.1
 
-    def act(self, obs: np.ndarray, deterministic: bool = False) -> List[int]:
-        """选择所有 tiles 的动作"""
-        actions = []
-        for tile_idx in range(self.num_tiles):
-            # 提取当前 tile 的状态
-            start_idx = tile_idx * self.tile_state_dim
-            end_idx = start_idx + self.tile_state_dim
-            tile_obs = obs[start_idx:end_idx]
+#     def act(self, obs: np.ndarray, deterministic: bool = False) -> List[int]:
+#         """选择所有 tiles 的动作"""
+#         actions = []
+#         for tile_idx in range(self.num_tiles):
+#             # 提取当前 tile 的状态
+#             start_idx = tile_idx * self.tile_state_dim
+#             end_idx = start_idx + self.tile_state_dim
+#             tile_obs = obs[start_idx:end_idx]
 
-            if np.random.random() < self.epsilon:
-                action = np.random.randint(self.action_size)
-            else:
-                with torch.no_grad():
-                    obs_tensor = torch.FloatTensor(tile_obs).unsqueeze(0)
-                    # print(f"{obs_tensor.size()}")
-                    logits, _ = self.model(obs_tensor)
-                    probs = torch.softmax(logits, dim=-1).squeeze(0)
+#             if np.random.random() < self.epsilon:
+#                 action = np.random.randint(self.action_size)
+#             else:
+#                 with torch.no_grad():
+#                     obs_tensor = torch.FloatTensor(tile_obs).unsqueeze(0)
+#                     # print(f"{obs_tensor.size()}")
+#                     logits, _ = self.model(obs_tensor)
+#                     probs = torch.softmax(logits, dim=-1).squeeze(0)
 
-                    # 直接在 tensor 上检查，无需转到 CPU/NumPy
-                    if (
-                        torch.any(torch.isnan(probs))
-                        or torch.any(torch.isinf(probs))
-                        or torch.any(probs < 0)
-                    ):
-                        action = np.random.randint(self.action_size)
-                    else:
-                        action = torch.multinomial(probs, 1).item()
+#                     # 直接在 tensor 上检查，无需转到 CPU/NumPy
+#                     if (
+#                         torch.any(torch.isnan(probs))
+#                         or torch.any(torch.isinf(probs))
+#                         or torch.any(probs < 0)
+#                     ):
+#                         action = np.random.randint(self.action_size)
+#                     else:
+#                         action = torch.multinomial(probs, 1).item()
 
-            actions.append(action)
+#             actions.append(action)
 
-        # print(f"actions length: {len(actions)}")
-        # print(f"actions: {actions}")
-        return actions
+#         # print(f"actions length: {len(actions)}")
+#         # print(f"actions: {actions}")
+#         return actions
 
-    def observe(self, obs, actions, reward, next_obs, done):
-        """观察经验 (暂时不更新)"""
-        pass
+#     def observe(self, obs, actions, reward, next_obs, done):
+#         """观察经验 (暂时不更新)"""
+#         pass
 
-    def save(self, path: str):
-        """保存模型"""
-        torch.save({
-            'model_state': self.model.state_dict(),
-            'tilesize': self.tilesize,
-            'num_tiles': self.num_tiles
-        }, path)
+#     def save(self, path: str):
+#         """保存模型"""
+#         torch.save({
+#             'model_state': self.model.state_dict(),
+#             'tilesize': self.tilesize,
+#             'num_tiles': self.num_tiles
+#         }, path)
 
-    def load(self, path: str):
-        """加载模型"""
-        checkpoint = torch.load(path)
-        self.model.load_state_dict(checkpoint['model_state'])
+#     def load(self, path: str):
+#         """加载模型"""
+#         checkpoint = torch.load(path)
+#         self.model.load_state_dict(checkpoint['model_state'])
 
 
 class TrainingLogger:
@@ -249,10 +249,8 @@ def train_cg_ppo(config: Dict):
     iteration_count = 0
     episode_count = 0
 
-    episodes_since_last_eval = 0
+    iterations_since_last_eval = 0
     episodes_since_last_save = 0
-
-    avg_steps_per_episode = 1  # 初始化，第一轮后更新
 
     while iteration_count < total_iterations:
         # 开始一个 episode
@@ -272,13 +270,21 @@ def train_cg_ppo(config: Dict):
             # 执行一步（一次完整的 CG 迭代）
             next_obs, reward, done, info = env.step(actions)
 
-            # 记录经验
-            agent.observe(obs, actions, reward, next_obs, done)
+            # 记录经验 (pfrl接口: observe(obs, reward, done, reset))
+            # 注意: 当done=True时，next_obs是空列表，不应该传递给agent
+            if not done:
+                reset = False  # episode未结束
+                agent.observe(next_obs, reward, done, reset)
+            else:
+                # episode结束时，需要告诉agent episode已结束
+                reset = True
+                agent.observe(obs, reward, done, reset)  # 使用当前obs，因为next_obs是空的
 
             # 更新统计
             episode_reward += reward
             episode_iterations += 1
             iteration_count += 1
+            iterations_since_last_eval += 1
 
             # 记录步骤
             logger.log_step(iteration_count, reward)
@@ -288,10 +294,15 @@ def train_cg_ppo(config: Dict):
                 print(f"Iteration {iteration_count}: episode {episode_count}, reward {reward:.3f}")
 
             obs = next_obs
+            
+            # 定期评估（以iteration为单位）
+            if iterations_since_last_eval >= eval_interval:
+                eval_stats = evaluate_agent(env, agent, num_episodes=1)
+                print(f"评估结果 (Iteration {iteration_count}): {eval_stats}")
+                iterations_since_last_eval = 0
 
         # Episode 结束
         episode_count += 1
-        episodes_since_last_eval += 1
         episodes_since_last_save += 1
 
         episode_info = env.get_episode_info()
@@ -305,12 +316,6 @@ def train_cg_ppo(config: Dict):
         logger.log_episode(episode_count, episode_stats)
 
         print(f"Episode {episode_count} 完成: total_reward {episode_stats.get('total_reward', 0):.3f}, iterations {episode_stats.get('iterations', 0)}, converged {episode_stats.get('converged', False)}")
-
-        # 定期评估（以episode为单位）
-        if episodes_since_last_eval >= eval_interval:
-            eval_stats = evaluate_agent(env, agent, num_episodes=1)
-            print(f"评估结果 (Episode {episode_count}): {eval_stats}")
-            episodes_since_last_eval = 0
 
         # 定期保存（以episode为单位）
         if episodes_since_last_save >= save_interval:
@@ -332,7 +337,7 @@ def train_cg_ppo(config: Dict):
     return log_dir
 
 
-def evaluate_agent(env: CGEnvironment, agent: MockPPOAgent, num_episodes: int = 10) -> Dict:
+def evaluate_agent(env: CGEnvironment, agent: CGPPOAgent, num_episodes: int = 10) -> Dict:
     """
     评估代理性能
 
@@ -364,7 +369,6 @@ def evaluate_agent(env: CGEnvironment, agent: MockPPOAgent, num_episodes: int = 
         episode_info = env.get_episode_info()
         total_rewards.append(episode_reward)
         costs.append(episode_info['total_cost'])
-        errors.append(episode_info['total_error'])
 
         if episode_info['converged']:
             converged_count += 1
@@ -373,7 +377,6 @@ def evaluate_agent(env: CGEnvironment, agent: MockPPOAgent, num_episodes: int = 
         'avg_reward': np.mean(total_rewards),
         'std_reward': np.std(total_rewards),
         'avg_cost': np.mean(costs),
-        'avg_error': np.mean(errors),
         'convergence_rate': converged_count / num_episodes,
         'num_episodes': num_episodes
     }
