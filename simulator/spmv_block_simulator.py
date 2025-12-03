@@ -43,24 +43,56 @@ class SparseMatrix:
         """
         self.rows = rows
         self.cols = cols
-        self.row_indices: np.ndarray = np.empty(0, dtype=np.int32)
-        self.col_indices: np.ndarray = np.empty(0, dtype=np.int32)
-        self.values: np.ndarray = np.empty(0, dtype=np.float64)
+        self.nnz = nnz
 
         if nnz > 0:
-            self.row_indices = np.zeros(nnz, dtype=np.int32)
-            self.col_indices = np.zeros(nnz, dtype=np.int32)
-            self.values = np.zeros(nnz, dtype=np.float64)
-            self.nnz = 0  # 当前实际非零元素数
+            self.row_indices: np.ndarray = np.empty(nnz, dtype=np.int32)
+            self.col_indices: np.ndarray = np.empty(nnz, dtype=np.int32)
+            self.values: np.ndarray = np.empty(nnz, dtype=np.float64)
+            self._current_idx = 0  # 当前添加位置
         else:
-            self.nnz = 0
+            self.row_indices: np.ndarray = np.array([], dtype=np.int32)
+            self.col_indices: np.ndarray = np.array([], dtype=np.int32)
+            self.values: np.ndarray = np.array([], dtype=np.float64)
+            self._current_idx = 0
 
     def add_element(self, row: int, col: int, value: float):
-        """添加矩阵元素"""
-        self.row_indices = np.append(self.row_indices, row)
-        self.col_indices = np.append(self.col_indices, col)
-        self.values = np.append(self.values, value)
-        self.nnz += 1
+        """添加矩阵元素（高效版本，避免np.append）"""
+        if self._current_idx >= len(self.row_indices):
+            raise RuntimeError(f"超出预分配的非零元素数量: {self._current_idx} >= {len(self.row_indices)}")
+
+        self.row_indices[self._current_idx] = row
+        self.col_indices[self._current_idx] = col
+        self.values[self._current_idx] = value
+        self._current_idx += 1
+
+    def add_elements_batch(self, rows: np.ndarray, cols: np.ndarray, values: np.ndarray):
+        """批量添加矩阵元素（高效版本）"""
+        n_new = len(rows)
+        if self._current_idx + n_new > len(self.row_indices):
+            raise RuntimeError(f"超出预分配的非零元素数量: {self._current_idx + n_new} > {len(self.row_indices)}")
+
+        self.row_indices[self._current_idx:self._current_idx + n_new] = rows
+        self.col_indices[self._current_idx:self._current_idx + n_new] = cols
+        self.values[self._current_idx:self._current_idx + n_new] = values
+        self._current_idx += n_new
+
+    def finalize(self):
+        """完成矩阵构造，确保nnz正确"""
+        # 如果通过add_element添加的元素少于预分配空间，使用_current_idx
+        # 否则假设数组已被直接填充，使用数组长度
+        if self._current_idx > 0:
+            self.nnz = self._current_idx
+            # 截断未使用的预分配空间
+            if self._current_idx < len(self.row_indices):
+                self.row_indices = self.row_indices[:self._current_idx]
+                self.col_indices = self.col_indices[:self._current_idx]
+                self.values = self.values[:self._current_idx]
+        else:
+            # 假设数组已被直接填充
+            actual_nnz = len(self.row_indices)
+            self.nnz = actual_nnz
+            self._current_idx = actual_nnz
 
     @property
     def shape(self):
@@ -165,6 +197,35 @@ class SpMVBlockSimulator:
         # 混合精度计算模式
         self.mixed_precision_mode = config.get('mixed_precision_mode', True)
 
+        # 向量量化缓存（性能优化）
+        self._vector_quantization_cache = {}  # (vector_id, precision_name) -> quantized_vector
+        self._cache_hit_count = 0
+        self._cache_miss_count = 0
+
+    def _get_quantized_vector(self, vector: List[float], precision_name: str) -> np.ndarray:
+        """
+        获取量化向量，使用缓存避免重复计算
+
+        Args:
+            vector: 输入向量
+            precision_name: 精度名称
+
+        Returns:
+            量化后的向量
+        """
+        # 使用向量内容的hash作为标识符（简单实现）
+        vector_tuple = tuple(vector)  # 转换为不可变类型用于hash
+        cache_key = (hash(vector_tuple), precision_name)
+
+        if cache_key in self._vector_quantization_cache:
+            self._cache_hit_count += 1
+            return self._vector_quantization_cache[cache_key]
+        else:
+            self._cache_miss_count += 1
+            quantized = PrecisionConverter.quantize_to_precision(vector, precision_name)
+            self._vector_quantization_cache[cache_key] = quantized
+            return quantized
+
     def _get_precision_name(self, action: int) -> str:
         """
         将动作转换为精度名称
@@ -210,7 +271,7 @@ class SpMVBlockSimulator:
 
         # 预先批量量化矩阵元素和向量，避免逐元素调用
         quantized_matrix_values = PrecisionConverter.quantize_to_precision(matrix_block.values, precision_name)
-        quantized_vector = PrecisionConverter.quantize_to_precision(full_vector, precision_name)
+        quantized_vector = self._get_quantized_vector(full_vector, precision_name)
 
         # 使用向量化操作计算所有非零元素的贡献
         valid_mask = matrix_block.col_indices < len(quantized_vector)
@@ -299,11 +360,12 @@ class SpMVBlockSimulator:
             tile_rows = end_row - start_row
 
             # 创建tile矩阵
-            tile_matrix = SparseMatrix(tile_rows, matrix.cols)
-            tile_matrix.row_indices = matrix.row_indices[tile_mask] - start_row
-            tile_matrix.col_indices = matrix.col_indices[tile_mask]
-            tile_matrix.values = matrix.values[tile_mask]
-            tile_matrix.nnz = np.sum(tile_mask)
+            tile_nnz = int(np.sum(tile_mask))
+            tile_matrix = SparseMatrix(tile_rows, matrix.cols, tile_nnz)
+            tile_matrix.row_indices[:] = matrix.row_indices[tile_mask] - start_row
+            tile_matrix.col_indices[:] = matrix.col_indices[tile_mask]
+            tile_matrix.values[:] = matrix.values[tile_mask]
+            tile_matrix.finalize()
 
             # 获取该 tile 的精度动作
             precision_action = actions_for_all_tiles[tile_idx]
@@ -339,11 +401,16 @@ def create_large_test_matrix(size: int = 1024, density: float = 0.01) -> SparseM
     Returns:
         稀疏矩阵
     """
-    matrix = SparseMatrix(size, size)
     np.random.seed(42)  # 确保可重现性
 
     # 计算期望的非零元素数量
     expected_nnz = int(size * size * density)
+
+    # 额外空间用于对角线元素
+    diagonal_nnz = int(size * 0.8)  # 80% 的行添加对角线元素
+    total_nnz = expected_nnz + diagonal_nnz
+
+    matrix = SparseMatrix(size, size, total_nnz)
 
     # 使用numpy批量生成随机非零元素
     rows = np.random.randint(0, size, expected_nnz)
@@ -351,10 +418,7 @@ def create_large_test_matrix(size: int = 1024, density: float = 0.01) -> SparseM
     values = np.random.uniform(-1.0, 1.0, expected_nnz)
 
     # 批量添加到矩阵
-    matrix.row_indices = rows.astype(np.int32)
-    matrix.col_indices = cols.astype(np.int32)
-    matrix.values = values.astype(np.float64)
-    matrix.nnz = expected_nnz
+    matrix.add_elements_batch(rows.astype(np.int32), cols.astype(np.int32), values.astype(np.float64))
 
     # 确保每行至少有一个元素（避免全零行）
     diagonal_mask = np.random.random(size) < 0.8  # 80% 的行添加对角线元素
@@ -363,11 +427,11 @@ def create_large_test_matrix(size: int = 1024, density: float = 0.01) -> SparseM
         diagonal_values = 2.0 + np.random.uniform(-0.5, 0.5, len(diagonal_indices))
 
         # 添加对角线元素
-        matrix.row_indices = np.concatenate([matrix.row_indices, diagonal_indices])
-        matrix.col_indices = np.concatenate([matrix.col_indices, diagonal_indices])
-        matrix.values = np.concatenate([matrix.values, diagonal_values])
-        matrix.nnz += len(diagonal_indices)
+        matrix.add_elements_batch(diagonal_indices.astype(np.int32),
+                                  diagonal_indices.astype(np.int32),
+                                  diagonal_values.astype(np.float64))
 
+    matrix.finalize()
     return matrix
 
 

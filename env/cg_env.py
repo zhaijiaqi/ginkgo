@@ -9,6 +9,7 @@ import math
 import random
 import csv
 import os
+import time
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -49,6 +50,7 @@ class CGEnvironment:
         self.matrix_name = config.get('matrix_name', None)  # 矩阵名称，如果为None则使用随机生成
         self.matrix_data_dir = config.get('matrix_data_dir', '~/data/matrix')
         self.matrix_set_csv = config.get('matrix_set_csv', 'matrix_set.csv')
+        self.matrix_size = int(config.get('matrix_size', 1024))  # 矩阵大小，默认1024
 
         # 奖励权重
         reward_config = config.get('reward', {})
@@ -88,10 +90,24 @@ class CGEnvironment:
         self.A_diagonal = None  # 对角线元素（用于兼容现有代码）
         self.matrix_loaded = False  # 标记矩阵是否已加载
 
+        # 预分组的tile数据（性能优化）
+        self.tile_blocks = None  # 按tile分组的矩阵块列表，每个元素是SparseMatrix
+
         # 轨迹跟踪
         self.episode_cpt_cost = 0.0
         self.tile_actions = []  # 当前迭代的所有 tile 动作
         self.step_rewards = []  # 每步奖励
+
+        # 性能分析
+        self.performance_stats = {
+            'total_time': 0.0,
+            'matrix_extraction_time': 0.0,
+            'spmv_time': 0.0,
+            'cg_math_time': 0.0,
+            'iteration_count': 0,
+            'cache_hits': 0,
+            'cache_misses': 0
+        }
 
         # 动作空间：6 种精度选择
         self.action_space_n = 6
@@ -157,7 +173,7 @@ class CGEnvironment:
 
         return A
 
-    def _generate_problem(self) -> Tuple[List[float], List[float]]:
+    def _generate_problem(self) -> Tuple[List[float], np.ndarray]:
         """
         生成 CG 测试问题 Ax = b
 
@@ -181,12 +197,15 @@ class CGEnvironment:
                 A_diagonal = self.A_matrix.diagonal().tolist()
 
                 # 生成右端项 b：A 的每一列元素之和
-                b = self.A_matrix.sum(axis=1).A1.tolist()
+                b = self.A_matrix.sum(axis=1).A1
 
                 print(f"Loaded matrix '{self.matrix_name}' with size {self.matrix_size}x{self.matrix_size}")
 
                 # 将矩阵转换为我们的 SparseMatrix 格式
                 self.A_sparse = self._csr_to_sparse_matrix(self.A_matrix)
+
+                # 预先计算tile块（性能优化）
+                self._precompute_tile_blocks()
 
                 self.matrix_loaded = True
 
@@ -200,7 +219,7 @@ class CGEnvironment:
 
         return A_diagonal, b
 
-    def _generate_random_problem(self) -> Tuple[List[float], List[float]]:
+    def _generate_random_problem(self) -> Tuple[List[float], np.ndarray]:
         """
         生成一个随机的 CG 测试问题（对角占优矩阵）
 
@@ -215,12 +234,16 @@ class CGEnvironment:
             A_diagonal.append(diagonal)
 
         # 生成右端项 b
-        b = [random.gauss(0, 1) for _ in range(self.matrix_size)]
+        b = np.array([random.gauss(0, 1) for _ in range(self.matrix_size)])
 
         # 为随机矩阵创建稀疏矩阵表示（对角矩阵）
-        self.A_sparse = SparseMatrix(self.matrix_size, self.matrix_size)
+        self.A_sparse = SparseMatrix(self.matrix_size, self.matrix_size, self.matrix_size)
         for i in range(self.matrix_size):
             self.A_sparse.add_element(i, i, A_diagonal[i])
+        self.A_sparse.finalize()
+
+        # 预先计算tile块（性能优化）
+        self._precompute_tile_blocks()
 
         self.matrix_loaded = True
         return A_diagonal, b
@@ -235,18 +258,45 @@ class CGEnvironment:
         Returns:
             SparseMatrix 实例
         """
-        sparse_mat = SparseMatrix(csr_mat.shape[0], csr_mat.shape[1])
-
-        # 将 CSR 格式转换为 COO 格式并添加到 SparseMatrix
+        # 将 CSR 格式转换为 COO 格式
         csr_mat_coo = csr_mat.tocoo()
-        for i, (row, col, val) in enumerate(zip(csr_mat_coo.row, csr_mat_coo.col, csr_mat_coo.data)):
-            sparse_mat.add_element(row, col, val)
+        nnz = len(csr_mat_coo.data)
+
+        sparse_mat = SparseMatrix(csr_mat.shape[0], csr_mat.shape[1], nnz)
+
+        # 批量添加元素
+        sparse_mat.add_elements_batch(
+            csr_mat_coo.row.astype(np.int32),
+            csr_mat_coo.col.astype(np.int32),
+            csr_mat_coo.data.astype(np.float64)
+        )
+        sparse_mat.finalize()
 
         return sparse_mat
 
+    def _precompute_tile_blocks(self):
+
+        """
+        预先计算所有tile的矩阵块（性能优化）
+        在矩阵加载后调用，避免每次迭代都重新提取
+        """
+        if self.A_sparse is None:
+            return
+
+        tilesize = self.spmv_sim.tilesize
+        num_tiles = (self.matrix_size + tilesize - 1) // tilesize
+        self.tile_blocks = []
+
+        # 为每个tile预先提取矩阵块
+        for tile_idx in range(num_tiles):
+            start_row = tile_idx * tilesize
+            end_row = min((tile_idx + 1) * tilesize, self.matrix_size)
+            tile_block = self._extract_matrix_block(start_row, end_row)
+            self.tile_blocks.append(tile_block)
+
     def _extract_matrix_block(self, start_row: int, end_row: int) -> SparseMatrix:
         """
-        提取矩阵的一个行块
+        提取矩阵的一个行块（优化版本，使用向量化操作）
 
         Args:
             start_row: 开始行索引
@@ -258,18 +308,27 @@ class CGEnvironment:
         if self.A_sparse is None:
             raise RuntimeError("矩阵未加载或转换失败")
 
-        block = SparseMatrix(end_row - start_row, self.A_sparse.cols)
+        # 使用向量化操作找到属于该行块的元素
+        mask = (self.A_sparse.row_indices >= start_row) & (self.A_sparse.row_indices < end_row)
+        block_nnz = np.sum(mask)
 
-        # 提取该行块的所有非零元素
-        for row, col, val in zip(self.A_sparse.row_indices,
-                                self.A_sparse.col_indices,
-                                self.A_sparse.values):
-            if start_row <= row < end_row:
-                block.add_element(row - start_row, col, val)
+        if block_nnz == 0:
+            # 空块
+            block = SparseMatrix(end_row - start_row, self.A_sparse.cols, 0)
+            block.finalize()
+            return block
+
+        block = SparseMatrix(end_row - start_row, self.A_sparse.cols, block_nnz)
+
+        # 批量提取和调整行索引
+        block.row_indices[:] = self.A_sparse.row_indices[mask] - start_row
+        block.col_indices[:] = self.A_sparse.col_indices[mask]
+        block.values[:] = self.A_sparse.values[mask]
+        block.finalize()
 
         return block
 
-    def _compute_exact_residual(self, x: List[float], A_diagonal: List[float], b: List[float]) -> List[float]:
+    def _compute_exact_residual(self, x: np.ndarray, A_diagonal: List[float], b: np.ndarray) -> np.ndarray:
         """
         计算精确残差 r = b - A*x
 
@@ -279,25 +338,21 @@ class CGEnvironment:
             b: 右端项
 
         Returns:
-            残差向量
+            残差向量 (numpy数组)
         """
         if self.A_matrix is not None:
             # 使用真实的稀疏矩阵计算 A*x
-            x_np = np.array(x)
-            Ax_np = self.A_matrix.dot(x_np)
-            Ax = Ax_np.tolist()
+            Ax_np = self.A_matrix.dot(x)
+            Ax = Ax_np
         else:
             # 使用对角线近似计算 A*x（兼容随机矩阵）
-            Ax = []
-            for i in range(len(x)):
-                ax_i = A_diagonal[i] * x[i]
-                Ax.append(ax_i)
+            Ax = np.array(A_diagonal) * x
 
         # 计算 r = b - A*x
         r = self.math_sim.vector_sub(b, Ax)
         return r
 
-    def _extract_state_features(self, sub_p: List[float], iteration: int) -> List[float]:
+    def _extract_state_features(self, sub_p: np.ndarray, iteration: int) -> List[float]:
         """
         提取状态特征向量
 
@@ -311,7 +366,10 @@ class CGEnvironment:
         features = []
 
         # 原始子向量
-        features.extend(sub_p)
+        if hasattr(sub_p, 'tolist'):
+            features.extend(sub_p.tolist())
+        else:
+            features.extend(sub_p)
 
         # # 统计特征
         # l1_norm = self.math_sim.vector_norm(sub_p, p=1)
@@ -336,7 +394,7 @@ class CGEnvironment:
 
         return features
     
-    def get_state_features(self, p: List[float], iteration: int) -> List[float]:
+    def get_state_features(self, p: np.ndarray, iteration: int) -> List[float]:
         """
         获取状态特征向量
         """
@@ -350,7 +408,7 @@ class CGEnvironment:
             sub_p = self.p[start_idx:end_idx]
             # 如果最后一个 tile 不足 tilesize，则补0
             if len(sub_p) < tilesize:
-                sub_p += [0.0] * (tilesize - len(sub_p))
+                sub_p = np.concatenate([sub_p, np.zeros(tilesize - len(sub_p))])
             tile_state = self._extract_state_features(sub_p, self.current_iteration)
             state.extend(tile_state)
         return state
@@ -376,11 +434,12 @@ class CGEnvironment:
 
         # 生成新的问题（可能更新matrix_size）
         A_diagonal, self.b = self._generate_problem()
+        self.A_diagonal = A_diagonal  # 缓存对角线元素
         
         self.b_norm = self.math_sim.vector_norm(self.b)
 
         # CG 初始化（确保使用更新后的matrix_size）
-        self.x = [0.0] * self.matrix_size  # x0 = 0
+        self.x = np.zeros(self.matrix_size)  # x0 = 0
         self.r = self._compute_exact_residual(self.x, A_diagonal, self.b)  # r0 = b - A*x0
         self.p = self.r.copy()  # p0 = r0
 
@@ -393,6 +452,17 @@ class CGEnvironment:
         self.episode_cpt_cost = 0.0
         self.tile_actions = []
         self.step_rewards = []
+
+        # 重置性能统计
+        self.performance_stats = {
+            'total_time': 0.0,
+            'matrix_extraction_time': 0.0,
+            'spmv_time': 0.0,
+            'cg_math_time': 0.0,
+            'iteration_count': 0,
+            'cache_hits': self.spmv_sim._cache_hit_count if hasattr(self.spmv_sim, '_cache_hit_count') else 0,
+            'cache_misses': self.spmv_sim._cache_miss_count if hasattr(self.spmv_sim, '_cache_miss_count') else 0
+        }
         
         return self.get_state_features(self.p, self.current_iteration)
 
@@ -409,6 +479,8 @@ class CGEnvironment:
         if self.episode_done:
             raise RuntimeError("Episode 已结束，请调用 reset()")
 
+        iteration_start_time = time.time()
+
         tilesize = self.spmv_sim.tilesize
         num_tiles = (self.matrix_size + tilesize - 1) // tilesize  # 向上取整计算 tile 数量
 
@@ -417,30 +489,31 @@ class CGEnvironment:
             raise ValueError(f"actions 长度 {len(actions)} 与 tile 数量 {num_tiles} 不匹配")
 
         print([int(a) for a in actions])
-        
+
         # 记录当前迭代的所有 tile 动作
         self.tile_actions = actions.copy()
 
-        # 初始化 Ap 向量
-        self.Ap = [0.0] * self.matrix_size
+        # 初始化 Ap 向量（使用numpy数组提高性能）
+        self.Ap = np.zeros(self.matrix_size, dtype=np.float64)
         iteration_cost = 0.0
 
-        # 为当前迭代的所有 tiles 执行 SpMV 计算
+        spmv_start_time = time.time()
+
+        # 为当前迭代的所有 tiles 执行 SpMV 计算（使用预计算的tile块）
         for tile_idx in range(num_tiles):
             start_idx = tile_idx * tilesize
             actual_tilesize = min(tilesize, self.matrix_size - start_idx)
             end_idx = start_idx + actual_tilesize
 
-            # 提取当前 tile 的矩阵块
-            matrix_block = self._extract_matrix_block(start_idx, end_idx)
+            # 使用预计算的tile块
+            matrix_block = self.tile_blocks[tile_idx]
 
             # 模拟该 tile 的 SpMV 计算
             action = actions[tile_idx]
             partial_result, cpt_cost = self.spmv_sim.simulate_spmv_block(matrix_block, self.p, action)
 
-            # 累加到 Ap 向量
-            for i in range(actual_tilesize):
-                self.Ap[start_idx + i] += partial_result[i]
+            # 累加到 Ap 向量（使用numpy切片操作）
+            self.Ap[start_idx:end_idx] += partial_result[:actual_tilesize]
 
             # 累加计算成本
             iteration_cost += cpt_cost
@@ -448,8 +521,14 @@ class CGEnvironment:
         # 累加到 episode 总成本
         self.episode_cpt_cost += iteration_cost
 
+        spmv_end_time = time.time()
+        self.performance_stats['spmv_time'] += (spmv_end_time - spmv_start_time)
+
         # 完成一次 CG 迭代
+        cg_math_start_time = time.time()
         converged, residual_norm, iter_done = self._complete_cg_iteration()
+        cg_math_end_time = time.time()
+        self.performance_stats['cg_math_time'] += (cg_math_end_time - cg_math_start_time)
 
         # 计算当前迭代的奖励
         iteration_reward = self.w1 * (-math.log(residual_norm/self.b_norm, 10)) - self.w2 * (iteration_cost/num_tiles) + self.w3 * converged
@@ -475,6 +554,14 @@ class CGEnvironment:
 
         self.step_rewards.append(iteration_reward)
 
+        # 更新性能统计
+        iteration_end_time = time.time()
+        self.performance_stats['total_time'] += (iteration_end_time - iteration_start_time)
+        self.performance_stats['iteration_count'] += 1
+        if hasattr(self.spmv_sim, '_cache_hit_count'):
+            self.performance_stats['cache_hits'] = self.spmv_sim._cache_hit_count
+            self.performance_stats['cache_misses'] = self.spmv_sim._cache_miss_count
+
         # 准备下一个状态
         if not done:
             # 为下一个迭代的所有 tiles 提取状态
@@ -488,7 +575,8 @@ class CGEnvironment:
             'episode_cost': self.episode_cpt_cost,
             'tile_actions': self.tile_actions.copy(),
             'converged': converged,
-            'residual_norm': residual_norm
+            'residual_norm': residual_norm,
+            'performance_stats': self.performance_stats.copy()
         }
 
         return next_state, iteration_reward, done, info

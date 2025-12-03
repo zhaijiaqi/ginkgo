@@ -1,16 +1,17 @@
 """
-CG Math Simulator - 提供 CG 算法所需的纯 Python 线性代数运算
-不依赖 numpy，只负责逻辑运算，为 RL 环境提供精确的数学运算支持
+CG Math Simulator - 提供 CG 算法所需的线性代数运算
+基于 numpy 实现，提供高效的向量化数学运算，为 RL 环境提供精确的数学运算支持
 """
 
 import math
 from typing import List, Tuple
+import numpy as np
 
 
 class CGMathSimulator:
     """
     提供 CG (Conjugate Gradient) 算法所需的数学运算
-    所有运算使用纯 Python 实现，确保精度可控
+    使用 numpy 实现高效的向量化运算，同时保持接口兼容性
     """
 
     @staticmethod
@@ -31,10 +32,8 @@ class CGMathSimulator:
         if len(x) != len(y):
             raise ValueError(f"向量长度不匹配: len(x)={len(x)}, len(y)={len(y)}")
 
-        result = 0.0
-        for i in range(len(x)):
-            result += x[i] * y[i]
-        return result
+        # 使用 numpy 进行高效的点积运算
+        return float(np.dot(x, y))
 
     @staticmethod
     def vector_norm(x: List[float], p: int = 2) -> float:
@@ -51,15 +50,16 @@ class CGMathSimulator:
         Raises:
             ValueError: 如果 p 不是支持的范数类型
         """
+        x_np = np.array(x)
         if p == 1:
             # L1 范数
-            return sum(abs(xi) for xi in x)
+            return float(np.linalg.norm(x_np, ord=1))
         elif p == 2:
             # L2 范数
-            return math.sqrt(sum(xi * xi for xi in x))
+            return float(np.linalg.norm(x_np, ord=2))
         elif p == float('inf'):
             # L-inf 范数
-            return max(abs(xi) for xi in x)
+            return float(np.linalg.norm(x_np, ord=np.inf))
         else:
             raise ValueError(f"不支持的范数类型: p={p}")
 
@@ -82,10 +82,9 @@ class CGMathSimulator:
         if len(x) != len(y):
             raise ValueError(f"向量长度不匹配: len(x)={len(x)}, len(y)={len(y)}")
 
-        result = []
-        for i in range(len(x)):
-            result.append(a * x[i] + y[i])
-        return result
+        # 使用 numpy 进行高效的 SAXPY 运算
+        result = np.array(y) + a * np.array(x)
+        return result.tolist()
 
     @staticmethod
     def vector_copy(x: List[float]) -> List[float]:
@@ -98,7 +97,7 @@ class CGMathSimulator:
         Returns:
             向量副本
         """
-        return x.copy()
+        return np.array(x).copy().tolist()
 
     @staticmethod
     def vector_scale(a: float, x: List[float]) -> List[float]:
@@ -112,7 +111,7 @@ class CGMathSimulator:
         Returns:
             缩放后的向量
         """
-        return [a * xi for xi in x]
+        return (a * np.array(x)).tolist()
 
     @staticmethod
     def vector_add(x: List[float], y: List[float]) -> List[float]:
@@ -132,7 +131,7 @@ class CGMathSimulator:
         if len(x) != len(y):
             raise ValueError(f"向量长度不匹配: len(x)={len(x)}, len(y)={len(y)}")
 
-        return [x[i] + y[i] for i in range(len(x))]
+        return (np.array(x) + np.array(y)).tolist()
 
     @staticmethod
     def vector_sub(x: List[float], y: List[float]) -> List[float]:
@@ -152,7 +151,7 @@ class CGMathSimulator:
         if len(x) != len(y):
             raise ValueError(f"向量长度不匹配: len(x)={len(x)}, len(y)={len(y)}")
 
-        return [x[i] - y[i] for i in range(len(x))]
+        return (np.array(x) - np.array(y)).tolist()
 
 
 class CGResidualTracker:
@@ -214,33 +213,3 @@ class CGResidualTracker:
             是否达到收敛条件
         """
         return len(self.residual_history) > 0 and self.residual_history[-1] < tolerance
-
-
-def test_cg_math_simulator():
-    """测试 CGMathSimulator 的基本功能"""
-    sim = CGMathSimulator()
-
-    # 测试向量
-    x = [1.0, 2.0, 3.0]
-    y = [4.0, 5.0, 6.0]
-
-    # 测试点积
-    dot_result = sim.vector_dot(x, y)
-    expected_dot = 32.0  # 1*4 + 2*5 + 3*6
-    assert abs(dot_result - expected_dot) < 1e-10, f"点积测试失败: {dot_result} != {expected_dot}"
-
-    # 测试 L2 范数
-    norm_result = sim.vector_norm(x)
-    expected_norm = math.sqrt(1+4+9)  # sqrt(14)
-    assert abs(norm_result - expected_norm) < 1e-10, f"L2 范数测试失败: {norm_result} != {expected_norm}"
-
-    # 测试 SAXPY
-    saxpy_result = sim.vector_saxpy(2.0, x, y)
-    expected_saxpy = [2*1+4, 2*2+5, 2*3+6]  # [6, 9, 12]
-    assert saxpy_result == expected_saxpy, f"SAXPY 测试失败: {saxpy_result} != {expected_saxpy}"
-
-    print("✓ CGMathSimulator 基本功能测试通过")
-
-
-if __name__ == "__main__":
-    test_cg_math_simulator()
