@@ -378,13 +378,6 @@ class CGEnvironment:
         else:
             features.extend(sub_p)
 
-        # # 统计特征
-        # l1_norm = self.math_sim.vector_norm(sub_p, p=1)
-        # l2_norm = self.math_sim.vector_norm(sub_p, p=2)
-        # max_abs = self.math_sim.vector_norm(sub_p, p=float('inf'))
-
-        # features.extend([l1_norm, l2_norm, max_abs])
-
         # 迭代索引（归一化）
         norm_iter = iteration / self.max_iter
         features.append(norm_iter)
@@ -504,8 +497,6 @@ class CGEnvironment:
         if len(actions) != num_tiles:
             raise ValueError(f"actions 长度 {len(actions)} 与 tile 数量 {num_tiles} 不匹配")
 
-        print([int(a) for a in actions])
-
         # 记录当前迭代的所有 tile 动作
         self.tile_actions = actions.copy()
 
@@ -559,6 +550,7 @@ class CGEnvironment:
         print(f"计算成本奖励: {-self.w2 * (iteration_cost/num_tiles)}")
         print(f"收敛奖励: {self.w3 * converged}")
         print(f"总奖励: {iteration_reward}")
+        print(f"tile 精度选择: {[int(a) for a in actions]}")
 
         # 检查是否结束
         done = iter_done

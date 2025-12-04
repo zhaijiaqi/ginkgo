@@ -11,6 +11,7 @@ import numpy as np
 from typing import Dict, Any, Optional, List
 import os
 import logging
+import time
 
 from models import create_cg_model
 
@@ -118,7 +119,10 @@ class CGPPOAgent:
             tile_obs = obs[start_idx:end_idx]
 
             # 使用对应代理为当前tile选择动作
+            # inference_start_time = time.time()
             action = self.tile_agents[tile_idx].act(tile_obs)
+            # inference_end_time = time.time()
+            # print(f"inference 时间: {(inference_end_time - inference_start_time) * 1000:.3f} ms")
             actions.append(action)
 
         return actions

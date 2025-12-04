@@ -141,75 +141,151 @@ class TrainingLogger:
         iterations = [s.get('iterations', 0) for s in self.episode_stats]
         converged = [1 if s.get('converged', False) else 0 for s in self.episode_stats]
 
-        # 创建主图 - 4x4布局
-        fig, axes = plt.subplots(4, 4, figsize=(20, 16))
+        # 计算有内容的图表数量，动态决定布局
+        num_plots = 0
+        has_reward = False
+        has_residual_history = bool(self.residual_histories)
+        has_tile_actions = bool(self.tile_action_histories)
+        
+        # 检查是否有reward数据
+        for stat in self.episode_stats:
+            if stat.get('mean') is not None or stat.get('total_reward') is not None or stat.get('reward') is not None:
+                has_reward = True
+                break
+        if not has_reward and self.step_stats:
+            has_reward = True  # 可以从step_stats计算
+        
+        # 计算需要的图表数量
+        num_plots = 2  # Total Cost, Iterations
+        if has_reward:
+            num_plots += 1
+        num_plots += 1  # Convergence Ratio
+        if has_residual_history:
+            num_plots += 1
+        if has_tile_actions:
+            num_plots += 1
+        num_plots += 1  # Summary
+        
+        # 使用3列布局，行数根据需要的图表数量计算
+        num_rows = (num_plots + 2) // 3  # 向上取整
+        if num_rows == 0:
+            num_rows = 1
+        fig, axes = plt.subplots(num_rows, 3, figsize=(18, 6 * num_rows))
+        if num_rows == 1:
+            axes = axes.reshape(1, -1)
+        elif num_rows > 1 and axes.ndim == 1:
+            axes = axes.reshape(num_rows, -1)
         fig.suptitle('CG Training Analysis Dashboard', fontsize=16, fontweight='bold')
-
+        
+        plot_idx = 0
+        
         # 1. 总成本曲线
-        axes[0, 0].plot(episodes, total_costs, 'b-', linewidth=2, marker='o', markersize=3)
-        axes[0, 0].set_title('Total Cost per Episode', fontweight='bold')
-        axes[0, 0].set_xlabel('Episode')
-        axes[0, 0].set_ylabel('Total Cost')
-        axes[0, 0].grid(True, alpha=0.3)
+        row, col = plot_idx // 3, plot_idx % 3
+        axes[row, col].plot(episodes, total_costs, 'b-', linewidth=2, marker='o', markersize=3)
+        axes[row, col].set_title('Total Cost per Episode', fontweight='bold')
+        axes[row, col].set_xlabel('Episode')
+        axes[row, col].set_ylabel('Total Cost')
+        axes[row, col].grid(True, alpha=0.3)
+        plot_idx += 1
 
         # 2. 迭代次数曲线
-        axes[0, 1].plot(episodes, iterations, 'r-', linewidth=2, marker='s', markersize=3)
-        axes[0, 1].set_title('Iterations per Episode', fontweight='bold')
-        axes[0, 1].set_xlabel('Episode')
-        axes[0, 1].set_ylabel('Iterations')
-        axes[0, 1].grid(True, alpha=0.3)
+        row, col = plot_idx // 3, plot_idx % 3
+        axes[row, col].plot(episodes, iterations, 'r-', linewidth=2, marker='s', markersize=3)
+        axes[row, col].set_title('Iterations per Episode', fontweight='bold')
+        axes[row, col].set_xlabel('Episode')
+        axes[row, col].set_ylabel('Iterations')
+        axes[row, col].grid(True, alpha=0.3)
+        plot_idx += 1
 
-        # 3. 收敛率
-        if len(converged) > 10:
-            window_size = 10
-            conv_rate = []
-            for i in range(window_size, len(converged) + 1):
-                conv_rate.append(sum(converged[i-window_size:i]) / window_size)
-            axes[0, 2].plot(range(window_size, len(episodes) + 1), conv_rate,
-                           'g-', linewidth=2, marker='^', markersize=3)
-        axes[0, 2].set_title('Convergence Rate (10-episode window)', fontweight='bold')
-        axes[0, 2].set_xlabel('Episode')
-        axes[0, 2].set_ylabel('Convergence Rate')
-        axes[0, 2].set_ylim(0, 1.1)
-        axes[0, 2].grid(True, alpha=0.3)
-
-        # 4. 奖励曲线
-        if self.step_rewards:
-            window_size = 100
-            if len(self.step_rewards) > window_size:
+        # 3. 奖励曲线（按 episode）
+        episode_rewards = []
+        episode_indices = []
+        
+        # 尝试从 episode_stats 中获取 reward
+        for stat in self.episode_stats:
+            # pfrl 的 eval_stats 通常包含 'mean' 字段表示平均 reward
+            # 也可能包含 'total_reward' 或其他 reward 相关字段
+            reward = stat.get('mean', stat.get('total_reward', stat.get('reward', None)))
+            if reward is not None:
+                episode_rewards.append(reward)
+                episode_indices.append(stat.get('episode', len(episode_rewards) - 1))
+        
+        # 如果 episode_stats 中没有 reward，从 step_stats 中按 episode 计算
+        if not episode_rewards and self.step_stats:
+            # 按 episode 分组计算总 reward
+            # 通过 iteration 字段来推断 episode 边界（每个 episode 的 iteration 从 0 或 1 开始）
+            current_episode_reward = 0
+            current_episode_idx = 0
+            last_iteration = None
+            
+            for step_stat in self.step_stats:
+                iteration = step_stat.get('iteration', 0)
+                reward = step_stat.get('reward', 0)
+                
+                # 如果 iteration 重置（变小或为 0/1），说明开始了新的 episode
+                if last_iteration is not None and iteration <= last_iteration:
+                    if current_episode_reward != 0:
+                        episode_rewards.append(current_episode_reward)
+                        episode_indices.append(current_episode_idx)
+                        current_episode_idx += 1
+                    current_episode_reward = reward
+                else:
+                    current_episode_reward += reward
+                
+                last_iteration = iteration
+            
+            # 添加最后一个 episode 的 reward
+            if current_episode_reward != 0:
+                episode_rewards.append(current_episode_reward)
+                episode_indices.append(current_episode_idx)
+        
+        if episode_rewards:
+            row, col = plot_idx // 3, plot_idx % 3
+            # 如果没有 episode 索引，使用默认的连续索引
+            if not episode_indices:
+                episode_indices = list(range(len(episode_rewards)))
+            
+            # 绘制 episode reward 曲线
+            axes[row, col].plot(episode_indices, episode_rewards, 'purple', linewidth=2, marker='o', markersize=3)
+            
+            # 可选：添加平滑曲线
+            if len(episode_rewards) > 10:
+                window_size = min(10, len(episode_rewards) // 5)
                 rewards_smooth = []
-                for i in range(window_size, len(self.step_rewards) + 1):
-                    rewards_smooth.append(sum(self.step_rewards[i-window_size:i]) / window_size)
-                axes[0, 3].plot(range(window_size, len(self.step_rewards) + 1), rewards_smooth,
-                               'purple', linewidth=2)
-        axes[0, 3].set_title('Average Reward (100-step window)', fontweight='bold')
-        axes[0, 3].set_xlabel('Step')
-        axes[0, 3].set_ylabel('Average Reward')
-        axes[0, 3].grid(True, alpha=0.3)
+                smooth_indices = []
+                for i in range(window_size, len(episode_rewards) + 1):
+                    rewards_smooth.append(sum(episode_rewards[i-window_size:i]) / window_size)
+                    # 使用对应位置的 episode 索引
+                    smooth_indices.append(episode_indices[i-1])
+                if smooth_indices:
+                    axes[row, col].plot(smooth_indices, rewards_smooth,
+                                       'orange', linewidth=2, linestyle='--', label=f'{window_size}-episode avg')
+                    axes[row, col].legend()
+            
+            axes[row, col].set_title('Reward per Episode', fontweight='bold')
+            axes[row, col].set_xlabel('Episode')
+            axes[row, col].set_ylabel('Reward')
+            axes[row, col].grid(True, alpha=0.3)
+            plot_idx += 1
 
-        # 5. 平均tile成本
-        avg_tile_costs = [s.get('avg_tile_cost', 0) for s in self.episode_stats]
-        axes[1, 0].plot(episodes, avg_tile_costs, 'orange', linewidth=2, marker='d', markersize=3)
-        axes[1, 0].set_title('Average Tile Cost per Episode', fontweight='bold')
-        axes[1, 0].set_xlabel('Episode')
-        axes[1, 0].set_ylabel('Avg Tile Cost')
-        axes[1, 0].grid(True, alpha=0.3)
-
-        # 6. 收敛比率
+        # 4. 收敛比率
+        row, col = plot_idx // 3, plot_idx % 3
         conv_ratios = [s.get('convergence_ratio', 0) for s in self.episode_stats]
-        axes[1, 1].plot(episodes, conv_ratios, 'brown', linewidth=2, marker='*', markersize=4)
-        axes[1, 1].set_title('Convergence Ratio per Episode', fontweight='bold')
-        axes[1, 1].set_xlabel('Episode')
-        axes[1, 1].set_ylabel('Convergence Ratio')
-        axes[1, 1].set_yscale('log')
-        axes[1, 1].grid(True, alpha=0.3)
+        axes[row, col].plot(episodes, conv_ratios, 'brown', linewidth=2, marker='*', markersize=4)
+        axes[row, col].set_title('Convergence Ratio per Episode', fontweight='bold')
+        axes[row, col].set_xlabel('Episode')
+        axes[row, col].set_ylabel('Convergence Ratio')
+        axes[row, col].set_yscale('log')
+        axes[row, col].grid(True, alpha=0.3)
+        plot_idx += 1
 
-        # 7. 残差历史示例（最近几个episode）
+        # 5. 残差历史示例（最近几个episode）
         if self.residual_histories:
-            axes[1, 2].set_title('Residual History (Recent Episodes)', fontweight='bold')
-            axes[1, 2].set_xlabel('Iteration')
-            axes[1, 2].set_ylabel('Residual Norm (log scale)')
-            axes[1, 2].set_yscale('log')
+            row, col = plot_idx // 3, plot_idx % 3
+            axes[row, col].set_title('Residual History (Recent Episodes)', fontweight='bold')
+            axes[row, col].set_xlabel('Iteration')
+            axes[row, col].set_ylabel('Residual Norm (log scale)')
+            axes[row, col].set_yscale('log')
 
             # 显示最近5个episode的残差历史
             recent_histories = self.residual_histories[-5:] if len(self.residual_histories) >= 5 else self.residual_histories
@@ -218,61 +294,24 @@ class TrainingLogger:
                 residual_history = hist.get('residual_history', [])
                 if residual_history:
                     iters = range(len(residual_history))
-                    axes[1, 2].plot(iters, residual_history,
-                                   color=colors[i % len(colors)],
-                                   linewidth=1.5,
-                                   label=f'Episode {hist["episode"]}',
-                                   alpha=0.8)
-            axes[1, 2].legend(fontsize='small')
-            axes[1, 2].grid(True, alpha=0.3)
+                    axes[row, col].plot(iters, residual_history,
+                                       color=colors[i % len(colors)],
+                                       linewidth=1.5,
+                                       label=f'Episode {hist["episode"]}',
+                                       alpha=0.8)
+            axes[row, col].legend(fontsize='small')
+            axes[row, col].grid(True, alpha=0.3)
+            plot_idx += 1
 
-        # 8. 性能统计 - 时间分布
-        if self.performance_stats_history:
-            latest_perf = self.performance_stats_history[-1]
-            spmv_time = max(0, latest_perf.get('spmv_time', 0) or 0)
-            cg_math_time = max(0, latest_perf.get('cg_math_time', 0) or 0)
-            matrix_ext_time = max(0, latest_perf.get('matrix_extraction_time', 0) or 0)
-            total_time = max(0, latest_perf.get('total_time', 0) or 0)
-            
-            other_time = max(0, total_time - spmv_time - cg_math_time - matrix_ext_time)
-            
-            times = [spmv_time, cg_math_time, matrix_ext_time, other_time]
-            labels = ['SpMV', 'CG Math', 'Matrix Ext', 'Other']
-            
-            # 过滤掉0值和NaN值
-            filtered_times = []
-            filtered_labels = []
-            for t, l in zip(times, labels):
-                if t > 0 and not (isinstance(t, float) and (np.isnan(t) or np.isinf(t))):
-                    filtered_times.append(t)
-                    filtered_labels.append(l)
-            
-            if filtered_times and sum(filtered_times) > 0:
-                axes[1, 3].pie(filtered_times, labels=filtered_labels, autopct='%1.1f%%', startangle=90)
-                axes[1, 3].set_title('Time Distribution (Latest Episode)', fontweight='bold')
-            else:
-                axes[1, 3].text(0.5, 0.5, 'No time data', ha='center', va='center', transform=axes[1, 3].transAxes)
-                axes[1, 3].set_title('Time Distribution (Latest Episode)', fontweight='bold')
-
-        # 9. 缓存性能
-        if self.performance_stats_history:
-            cache_hits = [s.get('cache_hits', 0) for s in self.performance_stats_history]
-            cache_misses = [s.get('cache_misses', 0) for s in self.performance_stats_history]
-            episodes_perf = [s['episode'] for s in self.performance_stats_history]
-
-            axes[2, 0].plot(episodes_perf, cache_hits, 'cyan', linewidth=2, label='Cache Hits', marker='o')
-            axes[2, 0].plot(episodes_perf, cache_misses, 'magenta', linewidth=2, label='Cache Misses', marker='s')
-            axes[2, 0].set_title('Cache Performance', fontweight='bold')
-            axes[2, 0].set_xlabel('Episode')
-            axes[2, 0].set_ylabel('Count')
-            axes[2, 0].legend()
-            axes[2, 0].grid(True, alpha=0.3)
-
-        # 10. Tile 动作分布（如果有tile动作历史）
+        # 6. Tile 动作分布（如果有tile动作历史）
         if self.tile_action_histories:
-            axes[2, 1].set_title('Tile Action Distribution', fontweight='bold')
-            axes[2, 1].set_xlabel('Precision Level')
-            axes[2, 1].set_ylabel('Frequency')
+            row, col = plot_idx // 3, plot_idx % 3
+            axes[row, col].set_title('Tile Action Distribution', fontweight='bold')
+            axes[row, col].set_xlabel('Precision Level')
+            axes[row, col].set_ylabel('Frequency')
+
+            # 精度名称映射
+            precision_names = ['fp64', 'fp32', 'tf32', 'fp16', 'bf16', 'fp8']
 
             # 收集所有动作
             all_actions = []
@@ -284,93 +323,21 @@ class TrainingLogger:
             if all_actions:
                 # 统计每种精度的使用频率
                 unique_actions, counts = np.unique(all_actions, return_counts=True)
-                axes[2, 1].bar(unique_actions, counts, color='skyblue', alpha=0.7, edgecolor='black')
-                axes[2, 1].set_xticks(range(max(unique_actions)+1))
-                axes[2, 1].grid(True, alpha=0.3, axis='y')
+                axes[row, col].bar(unique_actions, counts, color='skyblue', alpha=0.7, edgecolor='black')
+                
+                # 设置 x 轴刻度位置和标签
+                max_action = max(unique_actions) if len(unique_actions) > 0 else 0
+                xticks = range(max_action + 1)
+                xticklabels = [precision_names[i] if i < len(precision_names) else f'Action {i}' 
+                              for i in xticks]
+                axes[row, col].set_xticks(xticks)
+                axes[row, col].set_xticklabels(xticklabels, rotation=45, ha='right')
+                axes[row, col].grid(True, alpha=0.3, axis='y')
+            plot_idx += 1
 
-        # 11. 每步成本趋势
-        if self.step_stats:
-            steps = [s['step'] for s in self.step_stats]
-            iteration_costs = [s.get('iteration_cost', 0) for s in self.step_stats]
-
-            if len(steps) > 50:  # 只显示最近的点以避免拥挤
-                recent_idx = len(steps) - 50
-                steps = steps[recent_idx:]
-                iteration_costs = iteration_costs[recent_idx:]
-
-            axes[2, 2].scatter(steps, iteration_costs, alpha=0.6, color='coral', s=20)
-            axes[2, 2].set_title('Iteration Cost per Step', fontweight='bold')
-            axes[2, 2].set_xlabel('Training Step')
-            axes[2, 2].set_ylabel('Iteration Cost')
-            axes[2, 2].grid(True, alpha=0.3)
-
-        # 12. 残差收敛趋势
-        if self.step_stats:
-            steps = [s['step'] for s in self.step_stats]
-            residual_norms = [s.get('residual_norm', 0) for s in self.step_stats]
-
-            if len(steps) > 50:  # 只显示最近的点
-                recent_idx = len(steps) - 50
-                steps = steps[recent_idx:]
-                residual_norms = residual_norms[recent_idx:]
-
-            axes[2, 3].scatter(steps, residual_norms, alpha=0.6, color='darkgreen', s=20)
-            axes[2, 3].set_title('Residual Norm per Step', fontweight='bold')
-            axes[2, 3].set_xlabel('Training Step')
-            axes[2, 3].set_ylabel('Residual Norm')
-            axes[2, 3].set_yscale('log')
-            axes[2, 3].grid(True, alpha=0.3)
-
-        # 13. 初始vs最终残差
-        initial_residuals = [s.get('initial_residual', 0) for s in self.episode_stats if s.get('initial_residual', 0) > 0]
-        final_residuals = [s.get('final_residual', 0) for s in self.episode_stats if s.get('final_residual', 0) > 0]
-
-        if initial_residuals and final_residuals:
-            min_len = min(len(initial_residuals), len(final_residuals))
-            initial_residuals = initial_residuals[:min_len]
-            final_residuals = final_residuals[:min_len]
-            episodes_res = episodes[:min_len]
-
-            axes[3, 0].plot(episodes_res, initial_residuals, 'red', linewidth=2, label='Initial', marker='o')
-            axes[3, 0].plot(episodes_res, final_residuals, 'blue', linewidth=2, label='Final', marker='s')
-            axes[3, 0].set_title('Initial vs Final Residual', fontweight='bold')
-            axes[3, 0].set_xlabel('Episode')
-            axes[3, 0].set_ylabel('Residual Norm')
-            axes[3, 0].set_yscale('log')
-            axes[3, 0].legend()
-            axes[3, 0].grid(True, alpha=0.3)
-
-        # 14. 训练效率指标
-        if len(episodes) > 1:
-            # 计算收敛速度（每episode减少的残差）
-            conv_speeds = []
-            for i in range(1, len(episodes)):
-                if (self.episode_stats[i].get('initial_residual', 0) > 0 and
-                    self.episode_stats[i].get('final_residual', 0) > 0):
-                    speed = (self.episode_stats[i]['initial_residual'] /
-                           self.episode_stats[i]['final_residual'])
-                    conv_speeds.append(speed)
-
-            if conv_speeds:
-                axes[3, 1].plot(episodes[1:len(conv_speeds)+1], conv_speeds,
-                               'darkblue', linewidth=2, marker='d')
-                axes[3, 1].set_title('Convergence Speed', fontweight='bold')
-                axes[3, 1].set_xlabel('Episode')
-                axes[3, 1].set_ylabel('Initial/Final Residual Ratio')
-                axes[3, 1].set_yscale('log')
-                axes[3, 1].grid(True, alpha=0.3)
-
-        # 15. 成本效率分析
-        if len(total_costs) > 0 and len(iterations) > 0:
-            cost_per_iter = [c / max(i, 1) for c, i in zip(total_costs, iterations)]
-            axes[3, 2].plot(episodes, cost_per_iter, 'purple', linewidth=2, marker='h')
-            axes[3, 2].set_title('Cost per Iteration', fontweight='bold')
-            axes[3, 2].set_xlabel('Episode')
-            axes[3, 2].set_ylabel('Cost/Iteration')
-            axes[3, 2].grid(True, alpha=0.3)
-
-        # 16. 总结统计
-        axes[3, 3].axis('off')
+        # 7. 总结统计
+        row, col = plot_idx // 3, plot_idx % 3
+        axes[row, col].axis('off')
         summary_text = f"""
         Training Summary:
 
@@ -380,15 +347,20 @@ class TrainingLogger:
 
         Avg Iterations: {np.mean(iterations):.1f}
         Avg Total Cost: {np.mean(total_costs):.2f}
-        Avg Tile Cost: {np.mean(avg_tile_costs):.3f}
 
         Best Performance:
         Min Iterations: {min(iterations) if iterations else 'N/A'}
         Min Cost: {min(total_costs):.3f}
         """
-        axes[3, 3].text(0.05, 0.95, summary_text, transform=axes[3, 3].transAxes,
-                       fontsize=9, verticalalignment='top', fontfamily='monospace',
-                       bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+        axes[row, col].text(0.05, 0.95, summary_text, transform=axes[row, col].transAxes,
+                           fontsize=9, verticalalignment='top', fontfamily='monospace',
+                           bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+        
+        # 隐藏多余的子图
+        for i in range(plot_idx + 1, num_rows * 3):
+            row, col = i // 3, i % 3
+            if row < num_rows:
+                axes[row, col].axis('off')
 
         plt.tight_layout()
         plot_path = os.path.join(self.log_dir, 'cg_training_analysis.png')
@@ -398,8 +370,7 @@ class TrainingLogger:
 
         # 额外创建残差收敛详细图
         self._plot_residual_convergence_details()
-        # 额外创建性能分析图
-        self._plot_performance_analysis()
+        # 性能分析图已移除（不需要 time distribution 和 cache performance）
 
     def _plot_residual_convergence_details(self):
         """绘制残差收敛详细分析图"""
