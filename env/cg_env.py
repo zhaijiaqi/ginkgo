@@ -199,14 +199,15 @@ class CGEnvironment:
             try:
                 self.A_matrix = self._load_matrix_market(self.matrix_name)
                 self.matrix_size = self.A_matrix.shape[0]
+                self.matrix_nnz = self.A_matrix.nnz
 
                 # 提取对角线元素用于兼容现有代码
                 A_diagonal = self.A_matrix.diagonal().tolist()
 
-                # 生成右端项 b：A 的每一列元素之和
-                b = self.A_matrix.sum(axis=1).A1
+                # 生成右端项 b
+                b = np.array([random.gauss(0, 1) for _ in range(self.matrix_size)])
 
-                print(f"Loaded matrix '{self.matrix_name}' with size {self.matrix_size}x{self.matrix_size}")
+                print(f"Loaded matrix '{self.matrix_name}' with size {self.matrix_size}x{self.matrix_size}, nnz {self.matrix_nnz}")
 
                 # 将矩阵转换为我们的 SparseMatrix 格式
                 self.A_sparse = self._csr_to_sparse_matrix(self.A_matrix)
@@ -220,7 +221,9 @@ class CGEnvironment:
                 print(f"Failed to load matrix '{self.matrix_name}': {e}")
                 print("Falling back to random matrix generation")
                 self.matrix_name = None
-                return self._generate_random_problem()
+                A_diagonal, b = self._generate_random_problem()
+                self.matrix_loaded = True
+                return A_diagonal, b
         else:
             return self._generate_random_problem()
 
@@ -540,17 +543,33 @@ class CGEnvironment:
         # 计算当前迭代的奖励
         iteration_reward = self.w1 * (-math.log(residual_norm/self.b_norm, 10)) - self.w2 * (iteration_cost/num_tiles) + self.w3 * converged
 
-        print("")
-        print("================================================")
-        print(f"当前迭代次数: {self.current_iteration}")
-        print(f"当前迭代残差: {residual_norm}")
-        print(f"当前迭代每tile平均计算成本: {iteration_cost/num_tiles}")
-        print(f"当前迭代是否收敛: {converged}")
-        print(f"残差下降奖励: {self.w1 * (-math.log(residual_norm/self.b_norm, 10))}")
-        print(f"计算成本奖励: {-self.w2 * (iteration_cost/num_tiles)}")
-        print(f"收敛奖励: {self.w3 * converged}")
-        print(f"总奖励: {iteration_reward}")
-        print(f"tile 精度选择: {[int(a) for a in actions]}")
+        if self.current_iteration % 10 == 0 or converged:
+            print("")
+            print("================================================")
+            print(f"当前迭代次数: {self.current_iteration}")
+            print(f"当前迭代残差: {residual_norm}")
+            print(f"当前迭代每tile平均计算成本: {iteration_cost/num_tiles}")
+            print(f"当前迭代是否收敛: {converged}")
+            print(f"残差下降奖励: {self.w1 * (-math.log(residual_norm/self.b_norm, 10))}")
+            print(f"计算成本奖励: {-self.w2 * (iteration_cost/num_tiles)}")
+            print(f"收敛奖励: {self.w3 * converged}")
+            print(f"总奖励: {iteration_reward}")
+            # 统计每种精度选择的数量
+            from collections import Counter
+            precisions_to_test = [
+                ('fp64', 0),
+                ('fp32', 1),
+                ('tf32', 2),
+                ('fp16', 3),
+                ('bf16', 4),
+                ('fp8', 5)
+            ]
+            precision_code_to_name = {code: name for name, code in precisions_to_test}
+            precision_counts = Counter(int(a) for a in actions)
+            print("每种精度选择数量:")
+            for precision_code, count in sorted(precision_counts.items()):
+                precision_name = precision_code_to_name.get(precision_code, f"未知({precision_code})")
+                print(f"  精度 {precision_name}: {count} 个")
 
         # 检查是否结束
         done = iter_done
