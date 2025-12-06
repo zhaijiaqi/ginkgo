@@ -194,7 +194,9 @@ class PPOAgentFactory:
         Args:
             config: PPO 配置参数
         """
-        self.config = yaml_config.get('ppo', {})
+        # self.config = yaml_config.get('ppo', {})
+        self.config = yaml_config
+        self.ppo_config = self.config.get('ppo', {})
 
     def create_agent(self, state_dim: int, action_size: int) -> CGPPOAgent:
         """
@@ -209,7 +211,7 @@ class PPOAgentFactory:
         """
         # 计算tile数量
         # 假设每个tile的状态维度 = tilesize + 1（迭代索引）
-        tilesize = self.config.get('tilesize', 32)  # 从配置中读取tilesize
+        tilesize = self.config.get('spmv', {}).get('tilesize', 32)  # 从配置中读取tilesize
         tile_state_dim = tilesize + 1
         num_tiles = state_dim // tile_state_dim
 
@@ -217,7 +219,7 @@ class PPOAgentFactory:
 
         # PPO 参数（传递给子代理）
         
-        print("self.update_interval: ", self.config.get('update_interval', 2048))
+        print("self.update_interval: ", self.ppo_config.get('update_interval', 2048))
 
         # 创建 CG PPO 代理
         # 参数解释:
@@ -243,20 +245,20 @@ class PPOAgentFactory:
             num_tiles=num_tiles,
             tile_state_dim=tile_state_dim,
             action_size=action_size,
-            lr=float(self.config.get('learning_rate', 3e-4)),              # 学习率
-            gpu=self.config.get('gpu', 0),                                 # GPU设备编号
-            gamma=self.config.get('gamma', 0.99),                          # 折扣因子
-            lambd=self.config.get('lambda', 0.95),                         # GAE lambda
+            lr=float(self.ppo_config.get('learning_rate', 3e-4)),              # 学习率
+            gpu=self.ppo_config.get('gpu', 0),                                 # GPU设备编号
+            gamma=self.ppo_config.get('gamma', 0.99),                          # 折扣因子
+            lambd=self.ppo_config.get('lambda', 0.95),                         # GAE lambda
             phi=lambda x: np.asarray(x, dtype=np.float32),                 # 状态预处理
-            value_func_coef=self.config.get('value_coef', 0.5),            # 值函数损失系数
-            entropy_coef=self.config.get('entropy_coef', 0.01),            # 熵奖励系数
-            update_interval=self.config.get('update_interval', 1),         # 参数更新间隔
-            minibatch_size=self.config.get('minibatch_size', 64),          # 小批量样本数
-            epochs=self.config.get('n_epochs', 10),                        # 每 update 的 epoch 数
-            clip_eps=self.config.get('clip_eps', 0.2),                     # 策略裁剪参数
-            clip_eps_vf=self.config.get('clip_eps_vf', None),              # 值函数裁剪参数
-            standardize_advantages=self.config.get('standardize_advantages', True),  # 优势归一化
-            act_deterministically=self.config.get('act_deterministically', False),   # 行为是否确定性
+            value_func_coef=self.ppo_config.get('value_coef', 0.5),            # 值函数损失系数
+            entropy_coef=self.ppo_config.get('entropy_coef', 0.01),            # 熵奖励系数
+            update_interval=self.ppo_config.get('update_interval', 1),         # 参数更新间隔
+            minibatch_size=self.ppo_config.get('minibatch_size', 64),          # 小批量样本数
+            epochs=self.ppo_config.get('n_epochs', 10),                        # 每 update 的 epoch 数
+            clip_eps=self.ppo_config.get('clip_eps', 0.2),                     # 策略裁剪参数
+            clip_eps_vf=self.ppo_config.get('clip_eps_vf', None),              # 值函数裁剪参数
+            standardize_advantages=self.ppo_config.get('standardize_advantages', True),  # 优势归一化
+            act_deterministically=self.ppo_config.get('act_deterministically', False),   # 行为是否确定性
         )
         return agent
 

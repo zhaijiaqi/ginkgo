@@ -7,7 +7,7 @@ cg:
   matrix_set_csv: matrix_set.csv  # 矩阵信息CSV文件
 
 spmv:
-  tilesize: 32
+  tilesize: 64
   precision_cost_table:
     fp64: 1.0
     fp32: 0.7
@@ -34,7 +34,7 @@ ppo:
   update_interval: 10
 
 train:
-  total_steps: 1000
+  total_steps: 10000
   eval_interval: 1000
   save_interval: 1000
   log_interval: 1000
