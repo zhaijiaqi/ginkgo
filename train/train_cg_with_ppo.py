@@ -64,9 +64,9 @@ def extract_train_config(config: Dict) -> Dict:
     train_config = config.get('train', {})
     return {
         'total_steps': train_config.get('total_steps', 10000),
-        'eval_interval': train_config.get('eval_interval', 50),
-        'save_interval': train_config.get('save_interval', 50),
-        'log_interval': train_config.get('log_interval', 10)
+        'eval_interval': train_config.get('eval_interval', 1000),
+        'save_interval': train_config.get('save_interval', 1000),
+        'log_interval': train_config.get('log_interval', 1000)
     }
 
 
@@ -281,7 +281,7 @@ def train_cg_ppo(config: Dict):
         matrix_identifier = f"size{matrix_size}"
     else:
         matrix_identifier = matrix_name
-    log_dir = os.path.join('log', f'{matrix_identifier}_{timestamp}')
+    log_dir = os.path.join('log', f'{matrix_identifier}_tilesize{tilesize}_{timestamp}')
     logger = TrainingLogger(log_dir)
 
     # 训练参数

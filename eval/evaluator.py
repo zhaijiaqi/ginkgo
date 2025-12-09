@@ -63,10 +63,11 @@ def create_env_config(config: Dict, matrix_name: Optional[str] = None,
         环境配置字典
     """
     # 确定matrix_name
-    final_matrix_name = matrix_name if matrix_name is not None else config.get('cg', {}).get('matrix_name', None)
+    final_matrix_name = matrix_name if matrix_name is not None else config.get('cg', {}).get('matrix_name', 'None')
     
-    # 确定matrix_size：如果指定了matrix_size且matrix_name为None，使用指定的matrix_size
-    if matrix_size is not None and final_matrix_name is None:
+    if matrix_size is not None and final_matrix_name == 'None':
+        final_matrix_size = matrix_size
+    if matrix_size is not None:
         final_matrix_size = matrix_size
     else:
         final_matrix_size = config.get('cg', {}).get('matrix_size', 1024)

@@ -1,6 +1,6 @@
 cg:
   max_iter: 200
-  stop_tol: 1e-5
+  stop_tol: 1e-10
   matrix_size: 51200  # 矩阵大小 (n x n)，当使用真实矩阵时会被覆盖
   matrix_name: None  # 矩阵名称，从 matrix_set.csv 中选择， rajat05 比较小，但不适用于cg，muu适用于cg，但比较大
   matrix_data_dir: ~/data/matrix  # 矩阵数据目录
