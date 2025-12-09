@@ -22,33 +22,7 @@ import time
 from env.cg_env import CGEnvironment
 from agent.ppo_agent_factory import PPOAgentFactory, CGPPOAgent
 from utils import TrainingLogger, TrainingStatsHook, EvalHook, convert_to_serializable
-
-
-def create_env_config(config: Dict) -> Dict:
-    """
-    从训练配置创建环境配置
-
-    Args:
-        config: 训练配置字典
-
-    Returns:
-        环境配置字典
-    """
-    return {
-        'max_iter': config.get('cg', {}).get('max_iter', 100),
-        'stop_tol': config.get('cg', {}).get('stop_tol', 1e-10),
-        'matrix_size': config.get('cg', {}).get('matrix_size', 1024),  # 当使用真实矩阵时会被覆盖
-        'matrix_name': config.get('cg', {}).get('matrix_name', 'Muu'),  # 矩阵名称
-        'matrix_data_dir': config.get('cg', {}).get('matrix_data_dir', '~/data/matrix'),
-        'matrix_set_csv': config.get('cg', {}).get('matrix_set_csv', 'matrix_set.csv'),
-        'tilesize': config.get('spmv', {}).get('tilesize', 32),
-        'precision_cost_table': config.get('spmv', {}).get('precision_cost_table', {
-            'fp64': 1.0, 'fp32': 0.7, 'tf32': 0.55,
-            'fp16': 0.35, 'bf16': 0.33, 'fp8': 0.15
-        }),
-        'reward': config.get('reward'),
-        'normalize_state': config.get('env', {}).get('normalize_state', True)
-    }
+from utils import create_env_config, DoublePrecisionAgent
 
 
 def extract_train_config(config: Dict) -> Dict:
@@ -68,29 +42,6 @@ def extract_train_config(config: Dict) -> Dict:
         'save_interval': train_config.get('save_interval', 1000),
         'log_interval': train_config.get('log_interval', 1000)
     }
-
-
-class DoublePrecisionAgent:
-    """总是选择双精度 (fp64) 的简单代理"""
-
-    def __init__(self, num_tiles: int):
-        self.num_tiles = num_tiles
-
-    def act(self, obs):
-        """总是返回 fp64 动作 (0)"""
-        return [0] * self.num_tiles  # 0 = fp64
-
-    def observe(self, obs, reward, done, reset):
-        """什么都不做"""
-        pass
-
-    def save(self, path):
-        """什么都不做"""
-        pass
-
-    def load(self, path):
-        """什么都不做"""
-        pass
 
 
 class DoublePrecisionWrapperAgent:

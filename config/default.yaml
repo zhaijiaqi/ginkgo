@@ -1,7 +1,7 @@
 cg:
-  max_iter: 200
+  max_iter: 500
   stop_tol: 1e-10
-  matrix_size: 51200  # 矩阵大小 (n x n)，当使用真实矩阵时会被覆盖
+  matrix_size: 512  # 矩阵大小 (n x n)，当使用真实矩阵时会被覆盖
   matrix_name: None  # 矩阵名称，从 matrix_set.csv 中选择， rajat05 比较小，但不适用于cg，muu适用于cg，但比较大
   matrix_data_dir: ~/data/matrix  # 矩阵数据目录
   matrix_set_csv: matrix_set.csv  # 矩阵信息CSV文件
@@ -32,9 +32,10 @@ ppo:
   entropy_coef: 0.01
   gpu: 0  # 使用 GPU 0
   update_interval: 10
+  hidden_sizes: [64, 64]  # 神经网络隐藏层大小列表，例如 [64, 64] 表示两层，每层64个神经元
 
 train:
-  total_steps: 10000
+  total_steps: 50000
   eval_interval: 1000
   save_interval: 1000
   log_interval: 1000

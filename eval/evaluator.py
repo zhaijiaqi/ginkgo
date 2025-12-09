@@ -20,75 +20,14 @@ import matplotlib.colors as mcolors
 import matplotlib
 from typing import Dict, Optional, List
 
-# 设置matplotlib支持中文显示
-plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'sans-serif']
-plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
-
 # 导入项目模块
 from env.cg_env import CGEnvironment
 from agent.ppo_agent_factory import PPOAgentFactory, CGPPOAgent
 from agent.ppo_agent_factory import PfrlCompatibleCGPPOAgent
+from utils import create_env_config, load_model_weights, DoublePrecisionAgent, configure_matplotlib_chinese
 
-
-class DoublePrecisionAgent:
-    """总是选择双精度 (fp64) 的简单代理"""
-
-    def __init__(self, num_tiles: int):
-        self.num_tiles = num_tiles
-
-    def act(self, obs):
-        """总是返回 fp64 动作 (0)"""
-        return [0] * self.num_tiles  # 0 = fp64
-
-    def observe(self, obs, reward, done, reset):
-        """什么都不做"""
-        pass
-
-    def eval_mode(self):
-        """评估模式"""
-        return self
-
-
-def create_env_config(config: Dict, matrix_name: Optional[str] = None, 
-                      matrix_size: Optional[int] = None) -> Dict:
-    """
-    从训练配置创建环境配置
-
-    Args:
-        config: 训练配置字典
-        matrix_name: 矩阵名称（如果指定，会覆盖配置中的值）
-        matrix_size: 矩阵大小（如果指定且matrix_name为None，会覆盖配置中的值）
-
-    Returns:
-        环境配置字典
-    """
-    # 确定matrix_name
-    final_matrix_name = matrix_name if matrix_name is not None else config.get('cg', {}).get('matrix_name', 'None')
-    
-    if matrix_size is not None and final_matrix_name == 'None':
-        final_matrix_size = matrix_size
-    if matrix_size is not None:
-        final_matrix_size = matrix_size
-    else:
-        final_matrix_size = config.get('cg', {}).get('matrix_size', 1024)
-    
-    env_config = {
-        'max_iter': config.get('cg', {}).get('max_iter', 100),
-        'stop_tol': config.get('cg', {}).get('stop_tol', 1e-10),
-        'matrix_size': final_matrix_size,
-        'matrix_name': final_matrix_name,
-        'matrix_data_dir': config.get('cg', {}).get('matrix_data_dir', '~/data/matrix'),
-        'matrix_set_csv': config.get('cg', {}).get('matrix_set_csv', 'matrix_set.csv'),
-        'tilesize': config.get('spmv', {}).get('tilesize', 32),
-        'precision_cost_table': config.get('spmv', {}).get('precision_cost_table', {
-            'fp64': 1.0, 'fp32': 0.7, 'tf32': 0.55,
-            'fp16': 0.35, 'bf16': 0.33, 'fp8': 0.15
-        }),
-        'reward': config.get('reward'),
-        'normalize_state': config.get('env', {}).get('normalize_state', True),
-        'random_seed': config.get('random_seed', 42)  # 使用固定种子确保可重复性
-    }
-    return env_config
+# 设置matplotlib支持中文显示
+configure_matplotlib_chinese()
 
 
 def run_episode_with_agent(env: CGEnvironment, agent, seed: int = 42, 
@@ -169,69 +108,6 @@ def run_episode_with_agent(env: CGEnvironment, agent, seed: int = 42,
     return result
 
 
-def load_model_weights(model_path: str, config: Dict, env: CGEnvironment):
-    """
-    加载模型权重文件并创建代理
-
-    Args:
-        model_path: 模型权重文件路径（可以是.pt文件或目录，会自动处理）
-        config: 训练配置
-        env: CG环境（用于获取状态和动作空间维度）
-
-    Returns:
-        CGPPOAgent 实例
-    """
-    # 检查模型文件是否存在
-    original_path = model_path
-    if not os.path.exists(model_path):
-        # 尝试添加.pt后缀
-        if os.path.exists(f"{model_path}.pt"):
-            model_path = f"{model_path}.pt"
-        else:
-            raise FileNotFoundError(f"找不到模型权重文件: {original_path} 或 {original_path}.pt")
-
-    print(f"加载模型权重文件: {model_path}")
-    
-    # 创建代理
-    state_dim = env.get_state_dim()
-    action_size = env.get_action_space_size()
-    cg_agent = PPOAgentFactory(config).create_agent(state_dim, action_size)
-
-    # 加载模型权重（CGPPOAgent的load方法会处理路径）
-    try:
-        cg_agent.load(model_path)
-    except Exception as e:
-        # 如果加载失败，尝试直接加载权重文件（兼容旧格式）
-        print(f"标准加载方式失败: {e}")
-        print("尝试直接加载权重文件...")
-        if os.path.exists(model_path):
-            weights = torch.load(model_path, map_location='cpu', weights_only=False)
-            # 检查是否是直接的state_dict格式（包含child_modules键）
-            if isinstance(weights, dict):
-                # 检查是否包含模型权重键（如child_modules.0.0.0.weight）
-                has_model_keys = any('child_modules' in str(k) or 'weight' in str(k) for k in weights.keys())
-                if has_model_keys:
-                    # 直接加载到模型
-                    model = cg_agent.tile_agents[0].model
-                    model.load_state_dict(weights)
-                    print("直接加载权重成功")
-                else:
-                    raise ValueError(f"无法识别的权重文件格式: {model_path}")
-            else:
-                raise ValueError(f"权重文件不是字典格式: {model_path}")
-        else:
-            raise
-    
-    # 设置为评估模式
-    cg_agent.eval_mode()
-    for tile_agent in cg_agent.tile_agents:
-        if hasattr(tile_agent, 'eval'):
-            tile_agent.eval()
-        if hasattr(tile_agent, 'training'):
-            tile_agent.training = False
-
-    print("模型权重加载完成")
-    return cg_agent
 
 
 def plot_precision_heatmap(
@@ -400,6 +276,23 @@ def evaluate_model(model_path: str, matrix_name: Optional[str] = None,
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
+    # 先检测模型配置，确保环境配置与模型匹配
+    print("\n🔍 检测模型配置...")
+    from utils.model_utils import detect_model_config
+    model_config = detect_model_config(model_path)
+    
+    if model_config:
+        model_tilesize = model_config['tilesize']
+        current_tilesize = config.get('spmv', {}).get('tilesize', 32)
+        
+        if model_tilesize != current_tilesize:
+            print(f"⚠️  检测到模型训练时的tilesize ({model_tilesize}) 与当前配置 ({current_tilesize}) 不匹配")
+            print(f"正在更新配置以匹配模型...")
+            if 'spmv' not in config:
+                config['spmv'] = {}
+            config['spmv']['tilesize'] = model_tilesize
+            print(f"已更新配置: tilesize={model_tilesize}")
+
     # 创建环境配置
     env_config = create_env_config(config, matrix_name=matrix_name, matrix_size=matrix_size)
     env_config['random_seed'] = random_seed
@@ -456,11 +349,16 @@ def evaluate_model(model_path: str, matrix_name: Optional[str] = None,
     print("=" * 80)
 
     # 重新创建环境（确保使用相同的配置和seed）
+    # 注意：load_model_weights可能会更新config中的tilesize，所以需要重新创建环境
     env_model = CGEnvironment(env_config)
     
-    # 加载模型
+    # 加载模型（可能会更新config和env_model）
     print("\n加载模型权重...")
     cg_agent = load_model_weights(model_path, config, env_model)
+    
+    # 如果环境配置被更新了，需要重新获取tilesize和num_tiles
+    tilesize = env_model.spmv_sim.tilesize
+    num_tiles = (env_model.matrix_size + tilesize - 1) // tilesize
     
     # 创建评估代理
     pfrl_agent = PfrlCompatibleCGPPOAgent(cg_agent)

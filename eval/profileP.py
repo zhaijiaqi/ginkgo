@@ -22,95 +22,14 @@ import matplotlib
 from typing import Dict, Optional, List, Tuple
 from collections import defaultdict
 
-# 设置matplotlib支持中文显示
-plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'sans-serif']
-plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
-
 # 导入项目模块
 from env.cg_env import CGEnvironment
 from agent.ppo_agent_factory import PPOAgentFactory
 from agent.ppo_agent_factory import PfrlCompatibleCGPPOAgent
+from utils import create_env_config, load_model_weights, configure_matplotlib_chinese
 
-
-def create_env_config(config: Dict, matrix_name: Optional[str] = None, 
-                      matrix_size: Optional[int] = None) -> Dict:
-    """
-    从训练配置创建环境配置
-    """
-    final_matrix_name = matrix_name if matrix_name is not None else config.get('cg', {}).get('matrix_name', 'None')
-    
-    if matrix_size is not None and final_matrix_name == 'None':
-        final_matrix_size = matrix_size
-    if matrix_size is not None:
-        final_matrix_size = matrix_size
-    else:
-        final_matrix_size = config.get('cg', {}).get('matrix_size', 1024)
-    
-    env_config = {
-        'max_iter': config.get('cg', {}).get('max_iter', 100),
-        'stop_tol': config.get('cg', {}).get('stop_tol', 1e-10),
-        'matrix_size': final_matrix_size,
-        'matrix_name': final_matrix_name,
-        'matrix_data_dir': config.get('cg', {}).get('matrix_data_dir', '~/data/matrix'),
-        'matrix_set_csv': config.get('cg', {}).get('matrix_set_csv', 'matrix_set.csv'),
-        'tilesize': config.get('spmv', {}).get('tilesize', 32),
-        'precision_cost_table': config.get('spmv', {}).get('precision_cost_table', {
-            'fp64': 1.0, 'fp32': 0.7, 'tf32': 0.55,
-            'fp16': 0.35, 'bf16': 0.33, 'fp8': 0.15
-        }),
-        'reward': config.get('reward'),
-        'normalize_state': config.get('env', {}).get('normalize_state', True),
-        'random_seed': config.get('random_seed', 42)
-    }
-    return env_config
-
-
-def load_model_weights(model_path: str, config: Dict, env: CGEnvironment):
-    """
-    加载模型权重文件并创建代理
-    """
-    original_path = model_path
-    if not os.path.exists(model_path):
-        if os.path.exists(f"{model_path}.pt"):
-            model_path = f"{model_path}.pt"
-        else:
-            raise FileNotFoundError(f"找不到模型权重文件: {original_path} 或 {original_path}.pt")
-
-    print(f"加载模型权重文件: {model_path}")
-    
-    state_dim = env.get_state_dim()
-    action_size = env.get_action_space_size()
-    cg_agent = PPOAgentFactory(config).create_agent(state_dim, action_size)
-
-    try:
-        cg_agent.load(model_path)
-    except Exception as e:
-        print(f"标准加载方式失败: {e}")
-        print("尝试直接加载权重文件...")
-        if os.path.exists(model_path):
-            weights = torch.load(model_path, map_location='cpu', weights_only=False)
-            if isinstance(weights, dict):
-                has_model_keys = any('child_modules' in str(k) or 'weight' in str(k) for k in weights.keys())
-                if has_model_keys:
-                    model = cg_agent.tile_agents[0].model
-                    model.load_state_dict(weights)
-                    print("直接加载权重成功")
-                else:
-                    raise ValueError(f"无法识别的权重文件格式: {model_path}")
-            else:
-                raise ValueError(f"权重文件不是字典格式: {model_path}")
-        else:
-            raise
-    
-    cg_agent.eval_mode()
-    for tile_agent in cg_agent.tile_agents:
-        if hasattr(tile_agent, 'eval'):
-            tile_agent.eval()
-        if hasattr(tile_agent, 'training'):
-            tile_agent.training = False
-
-    print("模型权重加载完成")
-    return cg_agent
+# 设置matplotlib支持中文显示
+configure_matplotlib_chinese()
 
 
 def extract_sub_p_features(sub_p: np.ndarray) -> Dict[str, float]:
@@ -835,20 +754,8 @@ def profile_model(model_path: str, matrix_name: Optional[str] = None,
     }
     
     # 转换 numpy 类型为 Python 原生类型
-    def convert_numpy_types(obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, dict):
-            return {k: convert_numpy_types(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_numpy_types(item) for item in obj]
-        return obj
-    
-    save_data = convert_numpy_types(save_data)
+    from utils import convert_to_serializable
+    save_data = convert_to_serializable(save_data)
     
     with open(output_path, 'w') as f:
         json.dump(save_data, f, indent=2)

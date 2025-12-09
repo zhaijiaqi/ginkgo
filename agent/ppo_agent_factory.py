@@ -29,13 +29,14 @@ class CGPPOAgent:
     使用多个独立的PPO子代理，每个tile一个
     """
 
-    def __init__(self, num_tiles: int, tile_state_dim: int, action_size: int, **ppo_kwargs):
+    def __init__(self, num_tiles: int, tile_state_dim: int, action_size: int, hidden_sizes=None, **ppo_kwargs):
         self.num_tiles = num_tiles
         self.tile_state_dim = tile_state_dim
         self.action_size = action_size
+        self.hidden_sizes = hidden_sizes if hidden_sizes is not None else [64, 64]  # 默认隐藏层大小
 
         # 创建共享的模型（单个tile的状态维度）
-        shared_model = self._create_single_tile_model(tile_state_dim, action_size)
+        shared_model = self._create_single_tile_model(tile_state_dim, action_size, self.hidden_sizes)
 
         # 创建多个代理实例，但共享相同的模型参数
         self.tile_agents = []
@@ -50,11 +51,14 @@ class CGPPOAgent:
             agent = PPO(**agent_kwargs)
             self.tile_agents.append(agent)
 
-    def _create_single_tile_model(self, tile_state_dim: int, action_size: int):
-        """创建单个tile的模型"""
-        # 从ppo_kwargs中提取隐藏层大小，如果没有则使用默认值
-        hidden_sizes = [64, 64]  # 默认隐藏层大小
-
+    def _create_single_tile_model(self, tile_state_dim: int, action_size: int, hidden_sizes: list):
+        """创建单个tile的模型
+        
+        Args:
+            tile_state_dim: tile状态维度
+            action_size: 动作空间大小
+            hidden_sizes: 隐藏层大小列表，例如 [64, 64] 表示两层，每层64个神经元
+        """
         def make_policy_network():
             layers = []
             prev_size = tile_state_dim
@@ -149,6 +153,7 @@ class CGPPOAgent:
             'num_tiles': self.num_tiles,
             'tile_state_dim': self.tile_state_dim,
             'action_size': self.action_size,
+            'hidden_sizes': self.hidden_sizes,  # 保存隐藏层配置
         }
 
         # 保存第一个代理（所有代理共享相同模型，所以只需要保存一个）
@@ -168,6 +173,14 @@ class CGPPOAgent:
         assert saved_data['num_tiles'] == self.num_tiles
         assert saved_data['tile_state_dim'] == self.tile_state_dim
         assert saved_data['action_size'] == self.action_size
+        
+        # 如果保存的数据中包含hidden_sizes，验证是否匹配
+        if 'hidden_sizes' in saved_data:
+            if saved_data['hidden_sizes'] != self.hidden_sizes:
+                print(f"⚠️  警告: 保存的模型hidden_sizes ({saved_data['hidden_sizes']}) 与当前配置 ({self.hidden_sizes}) 不匹配")
+                print(f"   使用保存的模型配置: {saved_data['hidden_sizes']}")
+                # 注意：这里不更新self.hidden_sizes，因为模型结构已经创建好了
+                # 如果结构不匹配，会在加载权重时失败
 
         # 加载共享模型（加载到一个代理，然后所有代理都会共享相同的参数）
         agent_path = saved_data['shared_agent_path']
@@ -241,10 +254,19 @@ class PPOAgentFactory:
         # standardize_advantages: 是否对优势函数（Advantage）标准化
         # act_deterministically: 选择动作时是否用确定性策略（测试时常用）
 
+        # 从配置中读取隐藏层大小
+        hidden_sizes = self.ppo_config.get('hidden_sizes', [64, 64])
+        if isinstance(hidden_sizes, (list, tuple)):
+            hidden_sizes = list(hidden_sizes)
+        else:
+            # 如果配置不是列表，转换为列表
+            hidden_sizes = [hidden_sizes] if isinstance(hidden_sizes, int) else [64, 64]
+        
         agent = CGPPOAgent(
             num_tiles=num_tiles,
             tile_state_dim=tile_state_dim,
             action_size=action_size,
+            hidden_sizes=hidden_sizes,                                          # 隐藏层大小
             lr=float(self.ppo_config.get('learning_rate', 3e-4)),              # 学习率
             gpu=self.ppo_config.get('gpu', 0),                                 # GPU设备编号
             gamma=self.ppo_config.get('gamma', 0.99),                          # 折扣因子
