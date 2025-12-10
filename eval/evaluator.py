@@ -311,6 +311,7 @@ def evaluate_model(model_path: str, matrix_name: Optional[str] = None,
     print(f"  - Tile 大小: {tilesize}")
     print(f"  - 最大迭代次数: {env.max_iter}")
     print(f"  - 停止容差: {env.stop_tol}")
+    print(f"  - 初始解: {env.x[:10]}...")
 
     # 设置随机种子，确保两次运行使用相同的b
     random.seed(random_seed)

@@ -447,7 +447,7 @@ class CGEnvironment:
         self.b_norm = self.math_sim.vector_norm(self.b)
 
         # CG 初始化（确保使用更新后的matrix_size）
-        self.x = np.zeros(self.matrix_size)  # x0 = 0
+        self.x = np.ones(self.matrix_size)  # x0 = 1
         self.r = self._compute_exact_residual(self.x, A_diagonal, self.b)  # r0 = b - A*x0
         self.p = self.r.copy()  # p0 = r0
 
@@ -533,6 +533,7 @@ class CGEnvironment:
 
         spmv_end_time = time.time()
         self.performance_stats['spmv_time'] += (spmv_end_time - spmv_start_time)
+        print(f"spmv_time: {(spmv_end_time - spmv_start_time)*1000:.3f} ms")
 
         # 完成一次 CG 迭代
         cg_math_start_time = time.time()

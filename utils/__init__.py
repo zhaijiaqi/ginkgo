@@ -7,7 +7,7 @@ from .training_hooks import TrainingStatsHook, EvalHook
 from .data_utils import convert_to_serializable
 from .env_utils import create_env_config
 from .model_utils import load_model_weights, detect_model_config
-from .agents import DoublePrecisionAgent
+from .agents import DoublePrecisionAgent, FullFp64Agent, FullFp32Agent, FullFp8Agent
 from .plot_utils import configure_matplotlib_chinese
 
 __all__ = [
@@ -20,5 +20,8 @@ __all__ = [
     'load_model_weights',
     'detect_model_config',
     'DoublePrecisionAgent',
+    'FullFp64Agent',
+    'FullFp32Agent',
+    'FullFp8Agent',
     'configure_matplotlib_chinese'
 ]
