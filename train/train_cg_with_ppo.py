@@ -354,7 +354,7 @@ def final_evaluation(log_dir: str, config: Dict):
 
     # 1. 双精度 baseline 评估
     print("\n📊 运行双精度 baseline 评估...")
-    dp_agent = DoublePrecisionAgent(num_tiles)
+    dp_agent = DoublePrecisionWrapperAgent(num_tiles)
     dp_result = run_double_precision_episode_with_agent(env, dp_agent)
 
     # 2. 训练后模型评估

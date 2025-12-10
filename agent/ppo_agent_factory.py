@@ -113,23 +113,40 @@ class CGPPOAgent:
         return model
 
     def act(self, obs):
-        """为每个tile独立选择动作（参数共享的代理）"""
-        actions = []
+        """为每个tile独立选择动作（参数共享的代理）- 优化批量推理"""
+        # 直接将连续的obs数组重塑为批量形式，避免切分/合并开销
+        obs_array = np.asarray(obs, dtype=np.float32)
+        batch_obs = obs_array.reshape(self.num_tiles, self.tile_state_dim)
+        batch_obs = torch.from_numpy(batch_obs)
 
+        # 使用共享模型进行推理（所有代理共享相同模型）
+        model = self.tile_agents[0].model
+        device = next(model.parameters()).device
+        batch_obs = batch_obs.to(device)
+
+        # 前向传播获取策略分布
+        with torch.no_grad():
+            policy_out, _ = model(batch_obs)
+            # policy_out 是批量分类分布，从中采样动作
+            actions = policy_out.sample().cpu().numpy()
+
+        # 为每个代理设置状态（模拟act方法的行为）
         for tile_idx in range(self.num_tiles):
-            # 提取当前tile的状态
+            agent = self.tile_agents[tile_idx]
+
+            # 初始化batch变量（如果还没有初始化）
+            if agent.batch_last_episode is None:
+                agent._initialize_batch_variables(1)
+
+            # 设置上一次的状态和动作（模拟pfrl act方法的行为）
+            # 从原始obs中提取对应tile的观测
             start_idx = tile_idx * self.tile_state_dim
             end_idx = start_idx + self.tile_state_dim
             tile_obs = obs[start_idx:end_idx]
+            agent.batch_last_state = [tile_obs]
+            agent.batch_last_action = [actions[tile_idx]]
 
-            # 使用对应代理为当前tile选择动作
-            # inference_start_time = time.time()
-            action = self.tile_agents[tile_idx].act(tile_obs)
-            # inference_end_time = time.time()
-            # print(f"inference 时间: {(inference_end_time - inference_start_time) * 1000:.3f} ms")
-            actions.append(action)
-
-        return actions
+        return actions.tolist()  # 转换为列表以保持接口一致性
 
     def observe(self, obs, reward, done, reset):
         """观察多tile环境的转换（参数共享的代理）"""

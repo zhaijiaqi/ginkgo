@@ -2,7 +2,7 @@ cg:
   max_iter: 500
   stop_tol: 1e-10
   matrix_size: 512  # 矩阵大小 (n x n)，当使用真实矩阵时会被覆盖
-  matrix_name: Muu  # 矩阵名称，从 matrix_set.csv 中选择， Muu(7102), minsurfo(40806, model不收敛), mesh3e1(289), qa8fm(66127), thermomech_TC(102158, unknown)
+  matrix_name: qa8fm  # 矩阵名称，从 matrix_set.csv 中选择， Muu(7102), minsurfo(40806, model不收敛), mesh3e1(289), qa8fm(66127), thermomech_TC(102158, unknown)
   matrix_data_dir: ~/data/matrix  # 矩阵数据目录
   matrix_set_csv: matrix_set.csv  # 矩阵信息CSV文件
 
