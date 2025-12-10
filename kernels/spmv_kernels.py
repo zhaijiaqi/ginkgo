@@ -1,5 +1,8 @@
+import numpy as np
 import tilelang
 import tilelang.language as T
+import torch
+from scipy.sparse import coo_matrix
 
 
 @tilelang.jit(target="cuda")
@@ -26,15 +29,15 @@ def bsr_spmv_a100_native(
 
     @T.prim_func
     def main(
-        A_val: T.Tensor((MB, MAX_BLOCKS_PER_ROW, B, B), val_dtype),
+        A_val: T.Tensor((MB, MAX_BLOCKS_PER_ROW, B, B), val_dtype),  # type: ignore
         A_colind: T.Tensor(
             (
                 MB,
                 MAX_BLOCKS_PER_ROW,
             ),
             "int32",
-        ),
-        x: T.Tensor((N,), x_dtype),
+        ),  # type: ignore
+        x: T.Tensor((N,), x_dtype),  # type: ignore
         y: T.Tensor((M,), accum_dtype),
     ):
         # One block-row per CTA, B threads (one warp)
@@ -88,16 +91,16 @@ def bsr_spmv_a100_unroll_fuse_warp(
 
     @T.prim_func
     def main(
-        A_val: T.Tensor((MB, MAX_BLOCKS_PER_ROW, B, B), val_dtype),
+        A_val: T.Tensor((MB, MAX_BLOCKS_PER_ROW, B, B), val_dtype),  # type: ignore
         A_colind: T.Tensor(
             (
                 MB,
                 MAX_BLOCKS_PER_ROW,
             ),
             "int32",
-        ),
-        x: T.Tensor((N,), x_dtype),
-        y: T.Tensor((M,), accum_dtype),
+        ),  # type: ignore
+        x: T.Tensor((N,), x_dtype),  # type: ignore
+        y: T.Tensor((M,), accum_dtype),  # type: ignore
     ):
         # number of CTAs: MB / ROWS_PER_CTA   (assume divisible)
         grid_x = T.ceildiv(MB, ROWS_PER_CTA)
@@ -157,61 +160,267 @@ def bsr_spmv_a100_unroll_fuse_warp(
     return main
 
 
-@tilelang.jit(
-    out_idx=[4],  # y is the 5th argument
-    target="cuda",
-)
-def csr_spmv_a100(
-    M: int,
-    N: int,
-    NNZ: int,
-    BLOCK_ROWS: int = 128,  # threads per CTA
-    val_dtype: str = "float64",
-    x_dtype: str = "float64",
-    accum_dtype: str = "float64",
-):
+@tilelang.jit(target="cuda")
+def make_bsr_spmv_kernel(n_block_rows, nnzb, R, C, N):
     """
-    y = A * x where A is in CSR:
+    Build a y = A x SpMV kernel for BSR format.
 
-      A_data    : (NNZ,)       val_dtype
-      A_indices : (NNZ,)       int32
-      A_indptr  : (M+1,)       int32
-      x         : (N,)         x_dtype
-      y         : (M,)         accum_dtype
+    BSR representation:
+      data   : (nnzb, R, C) float32
+      indices: (nnzb,) int32           # block-column indices
+      indptr : (n_block_rows+1,) int32 # row pointer on block-rows
 
-    Mapping:
-      - gridDim.x = ceildiv(M, BLOCK_ROWS)
-      - blockDim.x = BLOCK_ROWS
-      - thread t in block bx handles row = bx * BLOCK_ROWS + t
+    Vector shapes:
+      x : (N,) float32                 # N = n_block_cols * C
+      y : (n_block_rows * R,) float32
     """
 
     @T.prim_func
     def main(
-        A_data: T.Tensor((NNZ,), val_dtype),
-        A_indices: T.Tensor((NNZ,), "int32"),
-        A_indptr: T.Tensor((M + 1,), "int32"),
-        x: T.Tensor((N,), x_dtype),
-        y: T.Tensor((M,), accum_dtype),
+        data: T.Tensor((nnzb, R, C), "float32"),
+        indices: T.Tensor((nnzb,), "int32"),
+        indptr: T.Tensor((n_block_rows + 1,), "int32"),
+        x: T.Tensor((N,), "float32"),
+        y: T.Tensor((n_block_rows * R,), "float64"),
     ):
-        grid_x = T.ceildiv(M, BLOCK_ROWS)
+        with T.Kernel(n_block_rows, threads=1) as (br,):
+            y_local = T.alloc_local((R,), "float64")
 
-        with T.Kernel(grid_x, threads=BLOCK_ROWS) as bx:
-            tid = T.get_thread_binding(0)  # 0..BLOCK_ROWS-1
-            row = bx * BLOCK_ROWS + tid
+            start = indptr[br]
+            end = indptr[br + 1]
+            length = end - start
 
-            if row < M:
-                row_start = A_indptr[row]
-                row_end = A_indptr[row + 1]
+            # Loop over all blocks in this block-row
+            for t in T.serial(length):
+                bk = start + t  # block index
+                bc = indices[bk]  # block-column index
+                x_base = bc * C  # starting col in x
 
-                acc = T.alloc_local((1,), accum_dtype)
-                T.clear(acc)
+                for rr in T.serial(R):
+                    for cc in T.serial(C):
+                        y_local[rr] += data[bk, rr, cc] * x[x_base + cc]
 
-                for k in T.serial(row_start, row_end):
-                    col = A_indices[k]
-                    a_ik = A_data[k].astype(accum_dtype)
-                    xk = x[col].astype(accum_dtype)
-                    acc[0] += a_ik * xk
-
-                y[row] = acc[0]
+            # Write the accumulated result back to y
+            row_base = br * R
+            for rr in T.serial(R):
+                y[row_base + rr] = y_local[rr]
 
     return main
+
+
+def bsr_spmv(data_bsr, indices_bsr, indptr_bsr, x, R, C, device="cuda"):
+    """
+    data_bsr   : (nnzb, R, C) float32 (numpy)
+    indices_bsr: (nnzb,) int32 (numpy)
+    indptr_bsr : (n_block_rows+1,) int32 (numpy)
+    x          : (N,) float32 (numpy)
+    R, C       : block size
+    """
+    data_bsr = np.asarray(data_bsr, dtype=np.float32)
+    indices_bsr = np.asarray(indices_bsr, dtype=np.int32)
+    indptr_bsr = np.asarray(indptr_bsr, dtype=np.int32)
+    x = np.asarray(x, dtype=np.float32)
+
+    nnzb = data_bsr.shape[0]
+    n_block_rows = indptr_bsr.shape[0] - 1
+    N = x.shape[0]
+    M = n_block_rows * R
+
+    # Move to device (torch tensors)
+    dev = torch.device(device)
+    data_t = torch.from_numpy(data_bsr).to(dev)
+    indices_t = torch.from_numpy(indices_bsr).to(dev)
+    indptr_t = torch.from_numpy(indptr_bsr).to(dev)
+    x_t = torch.from_numpy(x).to(dev)
+    y_t = torch.zeros((M,), dtype=torch.float64, device=dev)
+
+    # Build kernel specialized to these sizes
+    spmv_kernel = make_bsr_spmv_kernel(n_block_rows, nnzb, R, C, N)
+
+    print(f"{data_t=}, {indices_t=}, {indptr_t=}, {x_t=}")
+    # Run kernel
+    spmv_kernel(data_t, indices_t, indptr_t, x_t, y_t)
+    print(y_t)
+
+    # Back to numpy
+    y = y_t.cpu().numpy()
+    return y
+
+
+@tilelang.jit(target="cuda")
+def make_bsr_spmv_mixed_kernel(n_block_rows, nnzb, R, C, N):
+    """
+    Build a y = A x mixed SpMV kernel for BSR format.
+
+    BSR representation:
+      data   : (nnzb, R, C) float32
+      actions: (N / C,) int32          # Precision each block-column
+      indices: (nnzb,) int32           # block-column indices
+      indptr : (n_block_rows+1,) int32 # row pointer on block-rows
+
+    Vector shapes:
+      x : (N,) float32                 # N = n_block_cols * C
+      y : (n_block_rows * R,) float32
+    """
+
+    @T.prim_func
+    def main(
+        data: T.Tensor((nnzb, R, C), "float64"),
+        actions: T.Tensor((N // C,), "int32"),
+        indices: T.Tensor((nnzb,), "int32"),
+        indptr: T.Tensor((n_block_rows + 1,), "int32"),
+        x: T.Tensor((N,), "float64"),
+        y: T.Tensor((n_block_rows * R,), "float64"),
+    ):
+        with T.Kernel(n_block_rows, threads=1) as (br,):
+            y_local = T.alloc_local((R,), "float64")
+
+            start = indptr[br]
+            end = indptr[br + 1]
+            length = end - start
+
+            # Loop over all blocks in this block-row
+            for t in T.serial(length):
+                bk = start + t  # block index
+                bc = indices[bk]  # block-column index
+                x_base = bc * C  # starting col in x
+                action = actions[bc]
+
+                for rr in T.serial(R):
+                    for cc in T.serial(C):
+                        if action == 0:
+                            y_local[rr] += data[bk, rr, cc] * x[x_base + cc]
+                        elif action == 1:
+                            y_local[rr] += data[bk, rr, cc].astype("float32") * x[
+                                x_base + cc
+                            ].astype("float32")
+                        elif action == 2:
+                            y_local[rr] += data[bk, rr, cc].astype("float16") * x[
+                                x_base + cc
+                            ].astype("float16")
+                        elif action == 3:
+                            y_local[rr] += data[bk, rr, cc].astype("float8_e4m3") * x[
+                                x_base + cc
+                            ].astype("float8_e4m3")
+
+            # Write the accumulated result back to y
+            row_base = br * R
+            for rr in T.serial(R):
+                y[row_base + rr] = y_local[rr]
+
+    return main
+
+
+def bsr_spmv_mixed(data_bsr, actions, indices_bsr, indptr_bsr, x, R, C, device="cuda"):
+    """
+    data_bsr   : (nnzb, R, C) float32 (numpy)
+    indices_bsr: (nnzb,) int32 (numpy)
+    indptr_bsr : (n_block_rows+1,) int32 (numpy)
+    x          : (N,) float32 (numpy)
+    R, C       : block size
+    """
+    data_bsr = np.asarray(data_bsr, dtype=np.float64)
+    actions = np.asarray(actions, dtype=np.int32)
+    indices_bsr = np.asarray(indices_bsr, dtype=np.int32)
+    indptr_bsr = np.asarray(indptr_bsr, dtype=np.int32)
+    x = np.asarray(x, dtype=np.float64)
+
+    nnzb = data_bsr.shape[0]
+    n_block_rows = indptr_bsr.shape[0] - 1
+    N = x.shape[0]
+    M = n_block_rows * R
+
+    # Move to device (torch tensors)
+    dev = torch.device(device)
+    data_t = torch.from_numpy(data_bsr).to(dev)
+    actions_t = torch.from_numpy(actions).to(dev)
+    indices_t = torch.from_numpy(indices_bsr).to(dev)
+    indptr_t = torch.from_numpy(indptr_bsr).to(dev)
+    x_t = torch.from_numpy(x).to(dev)
+    y_t = torch.zeros((M,), dtype=torch.float64, device=dev)
+
+    # Build kernel specialized to these sizes
+    spmv_kernel = make_bsr_spmv_mixed_kernel(n_block_rows, nnzb, R, C, N)
+
+    # Run kernel
+    spmv_kernel(data_t, actions_t, indices_t, indptr_t, x_t, y_t)
+
+    # Back to numpy
+    y = y_t.cpu().numpy()
+    return y
+
+
+def test_bsr_spmv():
+    print("Running BSR spmv TileLang test...")
+    M, N = 100, 100
+    R, C = 4, 4  # BSR tile shape
+    density = 0.15
+
+    rng = np.random.default_rng(0)
+    size = M * N
+    nnz = int(size * density)
+
+    rows = rng.integers(0, M, size=nnz, dtype=np.int32)
+    cols = rng.integers(0, N, size=nnz, dtype=np.int32)
+    vals = rng.random(nnz, dtype=np.float64)
+
+    A_coo = coo_matrix((vals, (rows, cols)), shape=(M, N))
+
+    A_bsr = A_coo.tobsr(blocksize=(R, C))
+    A_bsr.sort_indices()
+    ref_data = A_bsr.data
+    ref_indices = A_bsr.indices
+    ref_indptr = A_bsr.indptr
+
+    x = np.random.randn(N).astype(np.float64)
+
+    y_ref = A_bsr @ x
+    y_tl = bsr_spmv(ref_data, ref_indices, ref_indptr, x, R, C, device="cuda")
+
+    print(y_tl)
+    print(y_ref)
+    assert np.allclose(y_tl, y_ref, rtol=1e-5, atol=1e-6)
+    print("BSR SpMV kernel matches SciPy.")
+
+
+def test_bsr_spmv_mixed():
+    print("Running BSR mixed spmv TileLang test...")
+    M, N = 100, 100
+    R, C = 4, 4  # BSR tile shape
+    density = 0.15
+
+    rng = np.random.default_rng(0)
+    size = M * N
+    nnz = int(size * density)
+
+    rows = rng.integers(0, M, size=nnz, dtype=np.int32)
+    cols = rng.integers(0, N, size=nnz, dtype=np.int32)
+    vals = rng.random(nnz, dtype=np.float64)
+
+    A_coo = coo_matrix((vals, (rows, cols)), shape=(M, N))
+
+    A_bsr = A_coo.tobsr(blocksize=(R, C))
+    A_bsr.sort_indices()
+    ref_data = A_bsr.data
+    ref_indices = A_bsr.indices
+    ref_indptr = A_bsr.indptr
+
+    x = np.random.randn(N).astype(np.float64)
+
+    y_ref = A_bsr @ x
+
+    # actions = np.full((N // C,), 3)
+    actions = np.random.randint(0, 2, size=N // C)
+    y_tl = bsr_spmv_mixed(
+        ref_data, actions, ref_indices, ref_indptr, x, R, C, device="cuda"
+    )
+
+    print(y_tl)
+    print(y_ref)
+    assert np.allclose(y_tl, y_ref, rtol=1e-5, atol=1e-6)
+    print("BSR SpMV kernel matches SciPy.")
+
+
+if __name__ == "__main__":
+    # test_bsr_spmv()
+    test_bsr_spmv_mixed()
