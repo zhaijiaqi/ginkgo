@@ -7,7 +7,9 @@
 
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 import yaml
 import numpy as np
@@ -26,6 +28,14 @@ from collections import defaultdict
 from env.cg_env import CGEnvironment
 from agent.ppo_agent_factory import PPOAgentFactory
 from agent.ppo_agent_factory import PfrlCompatibleCGPPOAgent
+
+# 显式导入本地utils模块
+import importlib.util
+utils_spec = importlib.util.spec_from_file_location("utils", os.path.join(project_root, "utils", "__init__.py"))
+utils = importlib.util.module_from_spec(utils_spec)
+sys.modules["utils"] = utils
+utils_spec.loader.exec_module(utils)
+
 from utils import create_env_config, load_model_weights, configure_matplotlib_chinese
 
 # 设置matplotlib支持中文显示
@@ -752,9 +762,8 @@ def profile_model(model_path: str, matrix_name: Optional[str] = None,
         'pattern_analysis': pattern_analysis,
         'total_selections': total_selections
     }
-    
+
     # 转换 numpy 类型为 Python 原生类型
-    from utils import convert_to_serializable
     save_data = convert_to_serializable(save_data)
     
     with open(output_path, 'w') as f:

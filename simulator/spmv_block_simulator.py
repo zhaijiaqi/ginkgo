@@ -20,10 +20,8 @@ class Precision(Enum):
     """支持的精度类型"""
     FP64 = 0
     FP32 = 1
-    TF32 = 2
-    FP16 = 3
-    BF16 = 4
-    FP8 = 5
+    FP16 = 2
+    FP8 = 3
 
 
 class SparseMatrix:
@@ -114,10 +112,8 @@ class PrecisionConverter:
     PRECISION_SPECS = {
         'fp64': {'exponent': 11, 'mantissa': 52, 'bias': 1023},
         'fp32': {'exponent': 8, 'mantissa': 23, 'bias': 127},
-        'tf32': {'exponent': 8, 'mantissa': 10, 'bias': 127},  # TensorFloat-32
         'fp16': {'exponent': 5, 'mantissa': 10, 'bias': 15},
-        'bf16': {'exponent': 8, 'mantissa': 7, 'bias': 127},   # Brain Float 16
-        'fp8': {'exponent': 5, 'mantissa': 2, 'bias': 15},     # FP8 E5M2
+        'fp8': {'exponent': 4, 'mantissa': 3, 'bias': 7},     # FP8 E4M3
     }
 
     @staticmethod
@@ -183,11 +179,9 @@ class SpMVBlockSimulator:
         # 精度成本表 (相对 fp64 的成本)
         self.precision_cost_table = config.get('precision_cost_table', {
             'fp64': 1.0,
-            'fp32': 0.7,
-            'tf32': 0.55,
-            'fp16': 0.35,
-            'bf16': 0.33,
-            'fp8': 0.15
+            'fp32': 0.5,
+            'fp16': 0.25,
+            'fp8': 0.125
         })
 
         # 随机数种子，用于重现性
@@ -242,10 +236,8 @@ class SpMVBlockSimulator:
         precision_map = {
             0: 'fp64',
             1: 'fp32',
-            2: 'tf32',
-            3: 'fp16',
-            4: 'bf16',
-            5: 'fp8'
+            2: 'fp16',
+            3: 'fp8'
         }
 
         if action not in precision_map:
@@ -487,10 +479,8 @@ def validate_spmv_accuracy(matrix_size: int = 1024):
     precisions_to_test = [
         ('fp64', 0),
         ('fp32', 1),
-        ('tf32', 2),
-        ('fp16', 3),
-        ('bf16', 4),
-        ('fp8', 5)
+        ('fp16', 2),
+        ('fp8', 3)
     ]
 
     results_summary = []

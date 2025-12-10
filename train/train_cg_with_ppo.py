@@ -4,7 +4,9 @@
 
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 import yaml
 import numpy as np
@@ -21,8 +23,41 @@ import time
 # 导入项目模块
 from env.cg_env import CGEnvironment
 from agent.ppo_agent_factory import PPOAgentFactory, CGPPOAgent
+
+# 显式导入本地utils模块
+import importlib.util
+utils_spec = importlib.util.spec_from_file_location("utils", os.path.join(project_root, "utils", "__init__.py"))
+utils = importlib.util.module_from_spec(utils_spec)
+sys.modules["utils"] = utils
+utils_spec.loader.exec_module(utils)
+
 from utils import TrainingLogger, TrainingStatsHook, EvalHook, convert_to_serializable
-from utils import create_env_config, DoublePrecisionAgent
+
+
+def create_env_config(config: Dict) -> Dict:
+    """
+    从训练配置创建环境配置
+
+    Args:
+        config: 训练配置字典
+
+    Returns:
+        环境配置字典
+    """
+    return {
+        'max_iter': config.get('cg', {}).get('max_iter', 100),
+        'stop_tol': config.get('cg', {}).get('stop_tol', 1e-10),
+        'matrix_size': config.get('cg', {}).get('matrix_size', 1024),  # 当使用真实矩阵时会被覆盖
+        'matrix_name': config.get('cg', {}).get('matrix_name', 'Muu'),  # 矩阵名称
+        'matrix_data_dir': config.get('cg', {}).get('matrix_data_dir', '~/data/matrix'),
+        'matrix_set_csv': config.get('cg', {}).get('matrix_set_csv', 'matrix_set.csv'),
+        'tilesize': config.get('spmv', {}).get('tilesize', 32),
+        'precision_cost_table': config.get('spmv', {}).get('precision_cost_table', {
+            'fp64': 1.0, 'fp32': 0.5, 'fp16': 0.25, 'fp8': 0.125
+        }),
+        'reward': config.get('reward'),
+        'normalize_state': config.get('env', {}).get('normalize_state', True)
+    }
 
 
 def extract_train_config(config: Dict) -> Dict:
@@ -249,7 +284,7 @@ def train_cg_ppo(config: Dict):
             env=env,
             steps=train_params['total_steps'],
             eval_n_steps=None,  # 不限制每次评估的步数
-            eval_n_episodes=10,  # 每次评估运行10个episode
+            eval_n_episodes=2,  # 每次评估运行10个episode
             eval_interval=train_params['eval_interval'],
             outdir=log_dir,
             checkpoint_freq=train_params['save_interval'],  # 定期保存检查点

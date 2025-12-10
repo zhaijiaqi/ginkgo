@@ -311,7 +311,7 @@ class TrainingLogger:
             axes[row, col].set_ylabel('Frequency')
 
             # 精度名称映射
-            precision_names = ['fp64', 'fp32', 'tf32', 'fp16', 'bf16', 'fp8']
+            precision_names = ['fp64', 'fp32', 'fp16', 'fp8']
 
             # 收集所有动作
             all_actions = []

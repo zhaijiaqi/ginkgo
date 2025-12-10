@@ -6,7 +6,9 @@
 
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 import yaml
 import numpy as np
@@ -19,6 +21,14 @@ from typing import Dict, Optional
 
 # 导入项目模块
 from env.cg_env import CGEnvironment
+
+# 显式导入本地utils模块
+import importlib.util
+utils_spec = importlib.util.spec_from_file_location("utils", os.path.join(project_root, "utils", "__init__.py"))
+utils = importlib.util.module_from_spec(utils_spec)
+sys.modules["utils"] = utils
+utils_spec.loader.exec_module(utils)
+
 from utils import create_env_config, DoublePrecisionAgent, FullFp8Agent, configure_matplotlib_chinese
 
 

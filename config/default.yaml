@@ -2,7 +2,7 @@ cg:
   max_iter: 500
   stop_tol: 1e-10
   matrix_size: 512  # 矩阵大小 (n x n)，当使用真实矩阵时会被覆盖
-  matrix_name: thermomech_TC  # 矩阵名称，从 matrix_set.csv 中选择， Muu(7102), minsurfo(40806, model不收敛), mesh3e1(289), qa8fm(66127), thermomech_TC(102158, unknown)
+  matrix_name: Muu  # 矩阵名称，从 matrix_set.csv 中选择， Muu(7102), minsurfo(40806, model不收敛), mesh3e1(289), qa8fm(66127), thermomech_TC(102158, unknown)
   matrix_data_dir: ~/data/matrix  # 矩阵数据目录
   matrix_set_csv: matrix_set.csv  # 矩阵信息CSV文件
 
@@ -10,17 +10,15 @@ spmv:
   tilesize: 64
   precision_cost_table:
     fp64: 1.0
-    fp32: 0.7
-    tf32: 0.55
-    fp16: 0.35
-    bf16: 0.33
-    fp8: 0.15
+    fp32: 0.5
+    fp16: 0.25
+    fp8: 0.125
 
 reward:
   type: weighted
-  w1: 1.0  # 数值误差奖励权重
+  w1: 3.0  # 数值误差奖励权重
   w2: 5.0  # 计算成本奖励权重
-  w3: 5.0 # 收敛性奖励权重
+  w3: 20.0 # 收敛性奖励权重
 
 ppo:
   gamma: 0.99
@@ -29,7 +27,7 @@ ppo:
   batch_size: 64
   clip_range: 0.2
   value_coef: 0.5
-  entropy_coef: 0.01      # TODO: 提高以鼓励探索
+  entropy_coef: 0.05      # TODO: 提高以鼓励探索
   gpu: 0  # 使用 GPU 0
   update_interval: 10
   hidden_sizes: [64, 64]  # 神经网络隐藏层大小列表，例如 [64, 64] 表示两层，每层64个神经元

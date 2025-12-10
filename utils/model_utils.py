@@ -166,7 +166,7 @@ def load_model_weights(model_path: str, config: Dict, env: CGEnvironment):
             config['spmv']['tilesize'] = model_tilesize
             
             # 重新创建环境以匹配模型配置
-            from utils import create_env_config
+            from .env_utils import create_env_config
             env_config = create_env_config(config)
             env = CGEnvironment(env_config)
             print(f"已更新环境配置: tilesize={model_tilesize}")
@@ -232,7 +232,7 @@ def load_model_weights(model_path: str, config: Dict, env: CGEnvironment):
             config['spmv']['tilesize'] = model_tilesize
             
             # 重新创建环境以匹配模型配置
-            from utils import create_env_config
+            from .env_utils import create_env_config
             env_config = create_env_config(config)
             env = CGEnvironment(env_config)
             print(f"已更新环境配置: tilesize={model_tilesize}")
