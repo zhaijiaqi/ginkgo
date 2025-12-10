@@ -17,6 +17,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from simulator.cg_math_simulator import CGMathSimulator, CGResidualTracker
 from simulator.spmv_block_simulator import SpMVBlockSimulator, SparseMatrix
 
+from kernels.spmv_kernels import bsr_spmv_mixed
+from kernels.coo2bsr_kernels import coo2bsr
+
+
 try:
     from scipy.io import mmread
     from scipy.sparse import csr_matrix
@@ -95,6 +99,16 @@ class CGEnvironment:
 
         # 预分组的tile数据（性能优化）
         self.tile_blocks = None  # 按tile分组的矩阵块列表，每个元素是SparseMatrix
+        
+        # BSR 格式数据（用于 TileLang kernel）
+        self.bsr_data = None  # BSR 数据块
+        self.bsr_indices = None  # BSR 列索引
+        self.bsr_indptr = None  # BSR 行指针
+        self.bsr_R = None  # BSR 行块大小
+        self.bsr_C = None  # BSR 列块大小
+        
+        # fp64 基准时间测量
+        self.fp64_baseline_time = None  # fp64 计算 Ap 的基准时间（毫秒）
 
         # 轨迹跟踪
         self.episode_cpt_cost = 0.0
@@ -115,9 +129,16 @@ class CGEnvironment:
             'cache_hits': 0,
             'cache_misses': 0
         }
+        
+        self.precision_cost_table = self.config.get('precision_cost_table', {
+            'fp64': 1.0,
+            'fp32': 0.5,
+            'fp16': 0.25,
+            'fp8': 0.125
+        })
 
         # 动作空间：6 种精度选择
-        self.action_space_n = 6
+        self.action_space_n = len(self.precision_cost_table.keys())
       
         # 重置环境
         self.reset()
@@ -199,20 +220,24 @@ class CGEnvironment:
             try:
                 self.A_matrix = self._load_matrix_market(self.matrix_name)
                 self.matrix_size = self.A_matrix.shape[0]
+                self.matrix_nnz = self.A_matrix.nnz
 
                 # 提取对角线元素用于兼容现有代码
                 A_diagonal = self.A_matrix.diagonal().tolist()
 
-                # 生成右端项 b：A 的每一列元素之和
-                b = self.A_matrix.sum(axis=1).A1
+                # 生成右端项 b
+                b = np.array([random.gauss(0, 1) for _ in range(self.matrix_size)])
 
-                print(f"Loaded matrix '{self.matrix_name}' with size {self.matrix_size}x{self.matrix_size}")
+                print(f"Loaded matrix '{self.matrix_name}' with size {self.matrix_size}x{self.matrix_size}, nnz {self.matrix_nnz}")
 
                 # 将矩阵转换为我们的 SparseMatrix 格式
                 self.A_sparse = self._csr_to_sparse_matrix(self.A_matrix)
 
                 # 预先计算tile块（性能优化）
                 self._precompute_tile_blocks()
+                
+                # 转换为 BSR 格式（用于 TileLang kernel）
+                self.bsr_data, self.bsr_indices, self.bsr_indptr, self.bsr_R, self.bsr_C = self._convert_matrix_to_bsr()
 
                 self.matrix_loaded = True
 
@@ -220,7 +245,9 @@ class CGEnvironment:
                 print(f"Failed to load matrix '{self.matrix_name}': {e}")
                 print("Falling back to random matrix generation")
                 self.matrix_name = None
-                return self._generate_random_problem()
+                A_diagonal, b = self._generate_random_problem()
+                self.matrix_loaded = True
+                return A_diagonal, b
         else:
             return self._generate_random_problem()
 
@@ -300,6 +327,38 @@ class CGEnvironment:
             end_row = min((tile_idx + 1) * tilesize, self.matrix_size)
             tile_block = self._extract_matrix_block(start_row, end_row)
             self.tile_blocks.append(tile_block)
+            
+            
+    def _convert_matrix_to_bsr(self):
+        """
+        将 COO 格式矩阵转换为 BSR 格式
+
+        使用 tilesize 作为块大小，使行块和列块数量与 RL 环境的 tile 数量匹配
+
+        Returns:
+            BSR 格式的数据: (data, indices, indptr, R, C)
+        """
+        if self.A_sparse is None:
+            raise RuntimeError("矩阵未加载")
+
+        # 使用 tilesize 作为 BSR 块大小
+        tilesize = self.spmv_sim.tilesize
+        R, C = tilesize, tilesize
+
+        # 准备 COO 数据，转换为 float32
+        row = self.A_sparse.row_indices.astype(np.int32)
+        col = self.A_sparse.col_indices.astype(np.int32)
+        val = self.A_sparse.values.astype(np.float32)
+        shape = (self.A_sparse.rows, self.A_sparse.cols)
+        blocksize = (R, C)
+
+        # 使用 TileLang coo2bsr kernel 进行转换
+        data_bsr, indices_bsr, indptr_bsr = coo2bsr(row, col, val, shape, blocksize)
+
+        # 转换为 float64 以匹配 bsr_spmv_mixed kernel 的期望
+        data_bsr = data_bsr.astype(np.float64)
+
+        return data_bsr, indices_bsr, indptr_bsr, R, C
 
     def _extract_matrix_block(self, start_row: int, end_row: int) -> SparseMatrix:
         """
@@ -378,13 +437,6 @@ class CGEnvironment:
         else:
             features.extend(sub_p)
 
-        # # 统计特征
-        # l1_norm = self.math_sim.vector_norm(sub_p, p=1)
-        # l2_norm = self.math_sim.vector_norm(sub_p, p=2)
-        # max_abs = self.math_sim.vector_norm(sub_p, p=float('inf'))
-
-        # features.extend([l1_norm, l2_norm, max_abs])
-
         # 迭代索引（归一化）
         norm_iter = iteration / self.max_iter
         features.append(norm_iter)
@@ -400,6 +452,65 @@ class CGEnvironment:
                     features[:len(sub_p)] = [(v - vec_mean) / vec_std for v in vector_part]
 
         return features
+    
+    def _get_precision_name(self, action: int) -> str:
+        """
+        将动作转换为精度名称
+
+        Args:
+            action: 精度动作 (0-5)
+
+        Returns:
+            精度名称字符串
+
+        Raises:
+            ValueError: 如果动作无效
+        """
+        precision_map = {
+            0: 'fp64',
+            1: 'fp32',
+            2: 'fp16',
+            3: 'fp8'
+        }
+
+        if action not in precision_map:
+            raise ValueError(f"无效的精度动作: {action}，必须在 0-5 范围内")
+
+        return precision_map[action]
+    
+    def _measure_fp64_baseline_time(self):
+        """
+        测量 fp64 精度的 SpMV 计算时间作为基准
+        """
+        tilesize = self.spmv_sim.tilesize
+        num_tiles = (self.matrix_size + tilesize - 1) // tilesize
+
+        # 创建全 fp64 精度的动作数组（动作 0 对应 fp64）
+        fp64_actions = np.zeros(num_tiles, dtype=np.int32)
+
+        # 预热10次
+        for _ in range(10):
+            _ = bsr_spmv_mixed(
+                self.bsr_data, fp64_actions, self.bsr_indices, self.bsr_indptr,
+                self.p, self.bsr_R, self.bsr_C, device="cuda"
+            )
+
+        # 正式测量多次取平均
+        num_measurements = 30
+        total_time = 0.0
+
+        for _ in range(num_measurements):
+            time_start = time.time()
+            Ap_baseline = bsr_spmv_mixed(
+                self.bsr_data, fp64_actions, self.bsr_indices, self.bsr_indptr,
+                self.p, self.bsr_R, self.bsr_C, device="cuda"
+            )
+            time_end = time.time()
+            total_time += (time_end - time_start) * 1000  # 转换为毫秒
+
+        self.fp64_baseline_time = total_time / num_measurements
+        print(f"fp64 基准时间已测量: {self.fp64_baseline_time:.2f} ms")
+
     
     def get_state_features(self, p: np.ndarray, iteration: int) -> List[float]:
         """
@@ -451,7 +562,7 @@ class CGEnvironment:
         self.b_norm = self.math_sim.vector_norm(self.b)
 
         # CG 初始化（确保使用更新后的matrix_size）
-        self.x = np.zeros(self.matrix_size)  # x0 = 0
+        self.x = np.ones(self.matrix_size)  # x0 = 1
         self.r = self._compute_exact_residual(self.x, A_diagonal, self.b)  # r0 = b - A*x0
         self.p = self.r.copy()  # p0 = r0
 
@@ -468,6 +579,10 @@ class CGEnvironment:
         # 重置最后一步信息
         self.last_reward = 0.0
         self.last_info = {}
+        
+        # # 测量 fp64 基准时间（如果尚未测量）
+        # if self.fp64_baseline_time is None and self.bsr_data is not None:
+        #     self._measure_fp64_baseline_time()
 
         # 重置性能统计
         self.performance_stats = {
@@ -504,41 +619,58 @@ class CGEnvironment:
         if len(actions) != num_tiles:
             raise ValueError(f"actions 长度 {len(actions)} 与 tile 数量 {num_tiles} 不匹配")
 
-        print([int(a) for a in actions])
-
         # 记录当前迭代的所有 tile 动作
         self.tile_actions = actions.copy()
 
         # 初始化 Ap 向量（使用numpy数组提高性能）
         self.Ap = np.zeros(self.matrix_size, dtype=np.float64)
-        iteration_cost = 0.0
 
         spmv_start_time = time.time()
 
-        # 为当前迭代的所有 tiles 执行 SpMV 计算（使用预计算的tile块）
-        for tile_idx in range(num_tiles):
-            start_idx = tile_idx * tilesize
-            actual_tilesize = min(tilesize, self.matrix_size - start_idx)
-            end_idx = start_idx + actual_tilesize
+        # 使用 TileLang BSR SpMV kernel 进行混合精度计算
+        if self.bsr_data is None:
+            raise RuntimeError("BSR 数据未初始化")
 
-            # 使用预计算的tile块
-            matrix_block = self.tile_blocks[tile_idx]
+        # 将 actions 转换为 numpy 数组
+        actions_np = np.array(actions, dtype=np.int32)
 
-            # 模拟该 tile 的 SpMV 计算
-            action = actions[tile_idx]
-            partial_result, cpt_cost = self.spmv_sim.simulate_spmv_block(matrix_block, self.p, action)
+        # 使用 TileLang kernel 执行 SpMV 计算
+        # time_start = time.time()
+        self.Ap = bsr_spmv_mixed(
+            self.bsr_data, actions_np, self.bsr_indices, self.bsr_indptr,
+            self.p, self.bsr_R, self.bsr_C, device="cuda"
+        )
 
-            # 累加到 Ap 向量（使用numpy切片操作）
-            self.Ap[start_idx:end_idx] += partial_result[:actual_tilesize]
+        # 裁剪 self.Ap 到实际矩阵大小，去掉 padding 的计算结果
+        if len(self.Ap) > self.matrix_size:
+            self.Ap = self.Ap[:self.matrix_size]
+        
+        # time_end = time.time()
+        # iteration_compute_time = (time_end - time_start)*1000
+        # print(f"TileLang BSR SpMV 计算时间: {iteration_compute_time:.2f} ms")
 
-            # 累加计算成本
-            iteration_cost += cpt_cost
-
+            
+            
+        # 真实计算总成本（相对于 fp64 基准时间的百分比）
+        # if self.fp64_baseline_time is not None and self.fp64_baseline_time > 0:
+        #     iteration_cpt_cost = (iteration_compute_time / self.fp64_baseline_time) * 100  # 百分比
+        #     print(f"相对于 fp64 基准时间的计算成本: {iteration_cpt_cost:.1f}%")
+        # else:
+        #     iteration_cpt_cost = iteration_compute_time  # 如果基准时间不可用，使用绝对时间
         # 累加到 episode 总成本
-        self.episode_cpt_cost += iteration_cost
+
+        # 计算每个 tile 的计算成本，并累加得到迭代总成本
+        iteration_cpt_cost = 0.0
+        for action in actions:
+            # action为int，对应精度编号，查表获得成本
+            action_name = self._get_precision_name(action)
+            cost = self.precision_cost_table.get(action_name, 1.0)
+            iteration_cpt_cost += cost
+        self.episode_cpt_cost += iteration_cpt_cost
 
         spmv_end_time = time.time()
         self.performance_stats['spmv_time'] += (spmv_end_time - spmv_start_time)
+        # print(f"spmv_time: {(spmv_end_time - spmv_start_time)*1000:.3f} ms")
 
         # 完成一次 CG 迭代
         cg_math_start_time = time.time()
@@ -547,18 +679,33 @@ class CGEnvironment:
         self.performance_stats['cg_math_time'] += (cg_math_end_time - cg_math_start_time)
 
         # 计算当前迭代的奖励
-        iteration_reward = self.w1 * (-math.log(residual_norm/self.b_norm, 10)) - self.w2 * (iteration_cost/num_tiles) + self.w3 * converged
+        iteration_reward = self.w1 * (-math.log(residual_norm/self.b_norm, 10)) - self.w2 * (iteration_cpt_cost/num_tiles) + self.w3 * converged
 
-        print("")
-        print("================================================")
-        print(f"当前迭代次数: {self.current_iteration}")
-        print(f"当前迭代残差: {residual_norm}")
-        print(f"当前迭代每tile平均计算成本: {iteration_cost/num_tiles}")
-        print(f"当前迭代是否收敛: {converged}")
-        print(f"残差下降奖励: {self.w1 * (-math.log(residual_norm/self.b_norm, 10))}")
-        print(f"计算成本奖励: {-self.w2 * (iteration_cost/num_tiles)}")
-        print(f"收敛奖励: {self.w3 * converged}")
-        print(f"总奖励: {iteration_reward}")
+        if self.current_iteration % 10 == 0 or converged:
+            print("")
+            print("================================================")
+            print(f"当前迭代次数: {self.current_iteration}")
+            print(f"当前迭代残差: {residual_norm}")
+            print(f"当前迭代每tile平均计算成本: {iteration_cpt_cost/num_tiles}")
+            print(f"当前迭代是否收敛: {converged}")
+            print(f"残差下降奖励: {self.w1 * (-math.log(residual_norm/self.b_norm, 10))}")
+            print(f"计算成本奖励: {-self.w2 * (iteration_cpt_cost/num_tiles)}")
+            print(f"收敛奖励: {self.w3 * converged}")
+            print(f"总奖励: {iteration_reward}")
+            # 统计每种精度选择的数量
+            from collections import Counter
+            precisions_to_test = [
+                ('fp64', 0),
+                ('fp32', 1),
+                ('fp16', 2),
+                ('fp8', 3)
+            ]
+            precision_code_to_name = {code: name for name, code in precisions_to_test}
+            precision_counts = Counter(int(a) for a in actions)
+            print("每种精度选择数量:")
+            for precision_code, count in sorted(precision_counts.items()):
+                precision_name = precision_code_to_name.get(precision_code, f"未知({precision_code})")
+                print(f"  精度 {precision_name}: {count} 个")
 
         # 检查是否结束
         done = iter_done
@@ -594,7 +741,7 @@ class CGEnvironment:
 
         info = {
             'iteration': self.current_iteration,
-            'iteration_cost': iteration_cost,
+            'iteration_cost': iteration_cpt_cost,
             'episode_cost': self.episode_cpt_cost,
             'tile_actions': self.tile_actions.copy(),
             'converged': converged,
@@ -607,6 +754,7 @@ class CGEnvironment:
         self.last_info = info.copy()
 
         return next_state, iteration_reward, done, info
+
 
     def _complete_cg_iteration(self) -> Tuple[float, bool]:
         """

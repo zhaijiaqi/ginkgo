@@ -11,8 +11,30 @@ import numpy as np
 from typing import Dict, Any, Optional, List
 import os
 import logging
+import time
 
 from models import create_cg_model
+
+
+class GradientClippingPPO(PPO):
+    """
+    带有梯度裁剪的 PPO 代理，用于防止梯度爆炸
+    """
+
+    def __init__(self, max_grad_norm=0.5, **kwargs):
+        super().__init__(**kwargs)
+        self.max_grad_norm = max_grad_norm
+
+    def _update(self, batch):
+        """重写更新方法，添加梯度裁剪"""
+        # 调用父类的更新逻辑
+        loss = super()._update(batch)
+
+        # 在反向传播后添加梯度裁剪
+        if self.max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+        return loss
 
 
 # 为了向后兼容，保留这个函数
@@ -28,13 +50,14 @@ class CGPPOAgent:
     使用多个独立的PPO子代理，每个tile一个
     """
 
-    def __init__(self, num_tiles: int, tile_state_dim: int, action_size: int, **ppo_kwargs):
+    def __init__(self, num_tiles: int, tile_state_dim: int, action_size: int, hidden_sizes=None, max_grad_norm=None, **ppo_kwargs):
         self.num_tiles = num_tiles
         self.tile_state_dim = tile_state_dim
         self.action_size = action_size
+        self.hidden_sizes = hidden_sizes if hidden_sizes is not None else [64, 64]  # 默认隐藏层大小
 
         # 创建共享的模型（单个tile的状态维度）
-        shared_model = self._create_single_tile_model(tile_state_dim, action_size)
+        shared_model = self._create_single_tile_model(tile_state_dim, action_size, self.hidden_sizes)
 
         # 创建多个代理实例，但共享相同的模型参数
         self.tile_agents = []
@@ -42,18 +65,25 @@ class CGPPOAgent:
             # 创建PPO代理的参数
             agent_kwargs = ppo_kwargs.copy()
             agent_kwargs['model'] = shared_model  # 所有代理共享同一个模型
-            agent_kwargs['optimizer'] = torch.optim.Adam(shared_model.parameters(), lr=ppo_kwargs.get('lr', 3e-4))
+            agent_kwargs['optimizer'] = torch.optim.Adam(shared_model.parameters(), lr=ppo_kwargs.get('lr', 1e-4))
             agent_kwargs.pop('lr', None)
 
-            # 创建代理实例
-            agent = PPO(**agent_kwargs)
+            # 添加梯度裁剪参数
+            if max_grad_norm is not None:
+                agent_kwargs['max_grad_norm'] = max_grad_norm
+
+            # 创建代理实例，使用带有梯度裁剪的 PPO
+            agent = GradientClippingPPO(**agent_kwargs)
             self.tile_agents.append(agent)
 
-    def _create_single_tile_model(self, tile_state_dim: int, action_size: int):
-        """创建单个tile的模型"""
-        # 从ppo_kwargs中提取隐藏层大小，如果没有则使用默认值
-        hidden_sizes = [64, 64]  # 默认隐藏层大小
-
+    def _create_single_tile_model(self, tile_state_dim: int, action_size: int, hidden_sizes: list):
+        """创建单个tile的模型
+        
+        Args:
+            tile_state_dim: tile状态维度
+            action_size: 动作空间大小
+            hidden_sizes: 隐藏层大小列表，例如 [64, 64] 表示两层，每层64个神经元
+        """
         def make_policy_network():
             layers = []
             prev_size = tile_state_dim
@@ -68,10 +98,17 @@ class CGPPOAgent:
             layers.append(nn.Linear(prev_size, action_size))
             policy_net = nn.Sequential(*layers)
 
-            # 初始化权重
+            # 添加数值稳定性：确保最后一层权重初始化更保守
+            if layers and isinstance(layers[-1], nn.Linear):
+                with torch.no_grad():
+                    # 将最后一层的权重初始化为很小的值
+                    layers[-1].weight.data *= 0.01
+                    layers[-1].bias.data.fill_(0.0)
+
+            # 初始化权重 - 使用更小的增益以提高数值稳定性
             for layer in policy_net:
                 if isinstance(layer, nn.Linear):
-                    nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+                    nn.init.orthogonal_(layer.weight, gain=0.01)  # 减小增益
                     nn.init.constant_(layer.bias, 0.0)
 
             return policy_net
@@ -108,20 +145,57 @@ class CGPPOAgent:
         return model
 
     def act(self, obs):
-        """为每个tile独立选择动作（参数共享的代理）"""
-        actions = []
+        """为每个tile独立选择动作（参数共享的代理）- 优化批量推理"""
+        # 直接将连续的obs数组重塑为批量形式，避免切分/合并开销
+        obs_array = np.asarray(obs, dtype=np.float32)
+        batch_obs = obs_array.reshape(self.num_tiles, self.tile_state_dim)
+        batch_obs = torch.from_numpy(batch_obs)
 
+        # 检查输入数据是否有 NaN 或 inf
+        if torch.isnan(batch_obs).any() or torch.isinf(batch_obs).any():
+            print(f"警告: 输入观测包含 NaN 或 inf 值: {batch_obs}")
+            # 用 0 替换 NaN/inf 值
+            batch_obs = torch.nan_to_num(batch_obs, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        # 使用共享模型进行推理（所有代理共享相同模型）
+        model = self.tile_agents[0].model
+        device = next(model.parameters()).device
+        batch_obs = batch_obs.to(device)
+
+        # 前向传播获取策略分布
+        with torch.no_grad():
+            policy_out, _ = model(batch_obs)
+
+            # 检查策略输出是否有 NaN
+            if hasattr(policy_out, 'logits'):
+                logits = policy_out.logits
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    print(f"警告: 策略 logits 包含 NaN 或 inf 值: {logits}")
+                    # 用小的随机值替换 NaN/inf logits
+                    logits = torch.nan_to_num(logits, nan=-1e-6, posinf=1e6, neginf=-1e6)
+                    # 重新创建分布
+                    policy_out = torch.distributions.Categorical(logits=logits)
+
+            # policy_out 是批量分类分布，从中采样动作
+            actions = policy_out.sample().cpu().numpy()
+
+        # 为每个代理设置状态（模拟act方法的行为）
         for tile_idx in range(self.num_tiles):
-            # 提取当前tile的状态
+            agent = self.tile_agents[tile_idx]
+
+            # 初始化batch变量（如果还没有初始化）
+            if agent.batch_last_episode is None:
+                agent._initialize_batch_variables(1)
+
+            # 设置上一次的状态和动作（模拟pfrl act方法的行为）
+            # 从原始obs中提取对应tile的观测
             start_idx = tile_idx * self.tile_state_dim
             end_idx = start_idx + self.tile_state_dim
             tile_obs = obs[start_idx:end_idx]
+            agent.batch_last_state = [tile_obs]
+            agent.batch_last_action = [actions[tile_idx]]
 
-            # 使用对应代理为当前tile选择动作
-            action = self.tile_agents[tile_idx].act(tile_obs)
-            actions.append(action)
-
-        return actions
+        return actions.tolist()  # 转换为列表以保持接口一致性
 
     def observe(self, obs, reward, done, reset):
         """观察多tile环境的转换（参数共享的代理）"""
@@ -145,6 +219,7 @@ class CGPPOAgent:
             'num_tiles': self.num_tiles,
             'tile_state_dim': self.tile_state_dim,
             'action_size': self.action_size,
+            'hidden_sizes': self.hidden_sizes,  # 保存隐藏层配置
         }
 
         # 保存第一个代理（所有代理共享相同模型，所以只需要保存一个）
@@ -164,6 +239,14 @@ class CGPPOAgent:
         assert saved_data['num_tiles'] == self.num_tiles
         assert saved_data['tile_state_dim'] == self.tile_state_dim
         assert saved_data['action_size'] == self.action_size
+        
+        # 如果保存的数据中包含hidden_sizes，验证是否匹配
+        if 'hidden_sizes' in saved_data:
+            if saved_data['hidden_sizes'] != self.hidden_sizes:
+                print(f"⚠️  警告: 保存的模型hidden_sizes ({saved_data['hidden_sizes']}) 与当前配置 ({self.hidden_sizes}) 不匹配")
+                print(f"   使用保存的模型配置: {saved_data['hidden_sizes']}")
+                # 注意：这里不更新self.hidden_sizes，因为模型结构已经创建好了
+                # 如果结构不匹配，会在加载权重时失败
 
         # 加载共享模型（加载到一个代理，然后所有代理都会共享相同的参数）
         agent_path = saved_data['shared_agent_path']
@@ -190,7 +273,9 @@ class PPOAgentFactory:
         Args:
             config: PPO 配置参数
         """
-        self.config = yaml_config.get('ppo', {})
+        # self.config = yaml_config.get('ppo', {})
+        self.config = yaml_config
+        self.ppo_config = self.config.get('ppo', {})
 
     def create_agent(self, state_dim: int, action_size: int) -> CGPPOAgent:
         """
@@ -205,7 +290,7 @@ class PPOAgentFactory:
         """
         # 计算tile数量
         # 假设每个tile的状态维度 = tilesize + 1（迭代索引）
-        tilesize = self.config.get('tilesize', 32)  # 从配置中读取tilesize
+        tilesize = self.config.get('spmv', {}).get('tilesize', 32)  # 从配置中读取tilesize
         tile_state_dim = tilesize + 1
         num_tiles = state_dim // tile_state_dim
 
@@ -213,7 +298,7 @@ class PPOAgentFactory:
 
         # PPO 参数（传递给子代理）
         
-        print("self.update_interval: ", self.config.get('update_interval', 2048))
+        print("self.update_interval: ", self.ppo_config.get('update_interval', 2048))
 
         # 创建 CG PPO 代理
         # 参数解释:
@@ -235,24 +320,34 @@ class PPOAgentFactory:
         # standardize_advantages: 是否对优势函数（Advantage）标准化
         # act_deterministically: 选择动作时是否用确定性策略（测试时常用）
 
+        # 从配置中读取隐藏层大小
+        hidden_sizes = self.ppo_config.get('hidden_sizes', [64, 64])
+        if isinstance(hidden_sizes, (list, tuple)):
+            hidden_sizes = list(hidden_sizes)
+        else:
+            # 如果配置不是列表，转换为列表
+            hidden_sizes = [hidden_sizes] if isinstance(hidden_sizes, int) else [64, 64]
+        
         agent = CGPPOAgent(
             num_tiles=num_tiles,
             tile_state_dim=tile_state_dim,
             action_size=action_size,
-            lr=float(self.config.get('learning_rate', 3e-4)),              # 学习率
-            gpu=self.config.get('gpu', 0),                                 # GPU设备编号
-            gamma=self.config.get('gamma', 0.99),                          # 折扣因子
-            lambd=self.config.get('lambda', 0.95),                         # GAE lambda
+            hidden_sizes=hidden_sizes,                                          # 隐藏层大小
+            lr=float(self.ppo_config.get('learning_rate', 1e-4)),              # 学习率
+            gpu=self.ppo_config.get('gpu', 0),                                 # GPU设备编号
+            gamma=self.ppo_config.get('gamma', 0.99),                          # 折扣因子
+            lambd=self.ppo_config.get('lambda', 0.95),                         # GAE lambda
             phi=lambda x: np.asarray(x, dtype=np.float32),                 # 状态预处理
-            value_func_coef=self.config.get('value_coef', 0.5),            # 值函数损失系数
-            entropy_coef=self.config.get('entropy_coef', 0.01),            # 熵奖励系数
-            update_interval=self.config.get('update_interval', 1),         # 参数更新间隔
-            minibatch_size=self.config.get('minibatch_size', 64),          # 小批量样本数
-            epochs=self.config.get('n_epochs', 10),                        # 每 update 的 epoch 数
-            clip_eps=self.config.get('clip_eps', 0.2),                     # 策略裁剪参数
-            clip_eps_vf=self.config.get('clip_eps_vf', None),              # 值函数裁剪参数
-            standardize_advantages=self.config.get('standardize_advantages', True),  # 优势归一化
-            act_deterministically=self.config.get('act_deterministically', False),   # 行为是否确定性
+            value_func_coef=self.ppo_config.get('value_coef', 0.5),            # 值函数损失系数
+            entropy_coef=self.ppo_config.get('entropy_coef', 0.01),            # 熵奖励系数
+            update_interval=self.ppo_config.get('update_interval', 1),         # 参数更新间隔
+            minibatch_size=self.ppo_config.get('minibatch_size', 64),          # 小批量样本数
+            epochs=self.ppo_config.get('n_epochs', 10),                        # 每 update 的 epoch 数
+            clip_eps=self.ppo_config.get('clip_eps', 0.2),                     # 策略裁剪参数
+            clip_eps_vf=self.ppo_config.get('clip_eps_vf', None),              # 值函数裁剪参数
+            standardize_advantages=self.ppo_config.get('standardize_advantages', True),  # 优势归一化
+            act_deterministically=self.ppo_config.get('act_deterministically', False),   # 行为是否确定性
+            max_grad_norm=self.ppo_config.get('max_grad_norm', 0.5),           # 梯度裁剪
         )
         return agent
 

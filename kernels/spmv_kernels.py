@@ -457,8 +457,8 @@ def test_bsr_spmv_mixed():
 
     y_ref = A_bsr @ x
 
-    actions = np.full((N // C,), 2)
-    # actions = np.random.randint(0, 2, size=N // C)
+    # actions = np.full((N // C,), 3)
+    actions = np.random.randint(0, 2, size=N // C)
     y_tl = bsr_spmv_mixed(
         ref_data, actions, ref_indices, ref_indptr, x, R, C, device="cuda"
     )
