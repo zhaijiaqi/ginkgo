@@ -263,10 +263,49 @@ def make_bsr_spmv_mixed_kernel(n_block_rows, nnzb, R, C, N):
       y : (n_block_rows * R,) float32
     """
 
+    def cast_fp_like(v, mantissa_bits):
+        # v: float64 的 PrimExpr
+        # mantissa_bits: int32 的 PrimExpr（例如 52, 23, 10, 7）
+        zero = T.Cast("float64", 0.0)
+        abs_v = T.abs(v)
+
+        # 指数 & 尾数： abs_v = mant * 2 ** exponent
+        exponent = T.floor(T.log2(abs_v))
+        pow2e = T.exp2(exponent)
+        mantissa = abs_v / pow2e
+
+        # mantissa_bits > 0 : 按 2**mantissa_bits 级数做 round
+        scale = T.exp2(T.Cast("float64", mantissa_bits))
+        mantissa_rounded = T.round(mantissa * scale) / scale
+
+        # mantissa_bits == 0 : mantissa >= 0.5 -> 1.0 else 0.0
+        mantissa_binary = T.if_then_else(
+            mantissa >= T.Cast("float64", 0.5),
+            T.Cast("float64", 1.0),
+            T.Cast("float64", 0.0),
+        )
+
+        mantissa_q = T.if_then_else(
+            mantissa_bits > 0,
+            mantissa_rounded,
+            mantissa_binary,
+        )
+
+        # 符号
+        sign = T.if_then_else(
+            v < zero,
+            T.Cast("float64", -1.0),
+            T.Cast("float64", 1.0),
+        )
+
+        non_zero = sign * mantissa_q * pow2e
+
+        return T.if_then_else(abs_v == zero, zero, non_zero)
+
     @T.prim_func
     def main(
         data: T.Tensor((nnzb, R, C), "float64"),
-        actions: T.Tensor((N // C,), "int32"),
+        actions: T.Tensor(((N + C - 1) // C,), "int32"),
         indices: T.Tensor((nnzb,), "int32"),
         indptr: T.Tensor((n_block_rows + 1,), "int32"),
         x: T.Tensor((N,), "float64"),
@@ -274,6 +313,10 @@ def make_bsr_spmv_mixed_kernel(n_block_rows, nnzb, R, C, N):
     ):
         with T.Kernel(n_block_rows, threads=1) as (br,):
             y_local = T.alloc_local((R,), "float64")
+
+            # Initialize y_local to zero
+            for rr in T.serial(R):
+                y_local[rr] = T.float64(0)
 
             start = indptr[br]
             end = indptr[br + 1]
@@ -286,22 +329,27 @@ def make_bsr_spmv_mixed_kernel(n_block_rows, nnzb, R, C, N):
                 x_base = bc * C  # starting col in x
                 action = actions[bc]
 
+                mantissa_bits = T.if_then_else(
+                    action == 0,
+                    T.int32(52),
+                    T.if_then_else(
+                        action == 1,
+                        T.int32(23),
+                        T.if_then_else(
+                            action == 2,
+                            T.int32(10),
+                            T.int32(7),
+                        ),
+                    ),
+                )
+
                 for rr in T.serial(R):
                     for cc in T.serial(C):
-                        if action == 0:
-                            y_local[rr] += data[bk, rr, cc] * x[x_base + cc]
-                        elif action == 1:
-                            y_local[rr] += data[bk, rr, cc].astype("float32") * x[
-                                x_base + cc
-                            ].astype("float32")
-                        elif action == 2:
-                            y_local[rr] += data[bk, rr, cc].astype("float16") * x[
-                                x_base + cc
-                            ].astype("float16")
-                        elif action == 3:
-                            y_local[rr] += data[bk, rr, cc].astype("float8_e4m3") * x[
-                                x_base + cc
-                            ].astype("float8_e4m3")
+                        col_idx = x_base + cc
+                        if col_idx < N:
+                            vA = cast_fp_like(data[bk, rr, cc], mantissa_bits)
+                            vx = cast_fp_like(x[col_idx], mantissa_bits)
+                            y_local[rr] += vA * vx
 
             # Write the accumulated result back to y
             row_base = br * R
@@ -409,8 +457,8 @@ def test_bsr_spmv_mixed():
 
     y_ref = A_bsr @ x
 
-    # actions = np.full((N // C,), 3)
-    actions = np.random.randint(0, 2, size=N // C)
+    actions = np.full((N // C,), 2)
+    # actions = np.random.randint(0, 2, size=N // C)
     y_tl = bsr_spmv_mixed(
         ref_data, actions, ref_indices, ref_indptr, x, R, C, device="cuda"
     )
