@@ -80,46 +80,57 @@ def extract_train_config(config: Dict) -> Dict:
 
 
 class DoublePrecisionWrapperAgent:
-    """包装 PPO 代理，在第一个 episode 强制使用双精度动作"""
+    """包装 PPO 代理，每10个episode强制使用一次双精度动作"""
 
-    def __init__(self, ppo_agent, num_tiles: int, force_double_precision_episodes: int = 1):
+    def __init__(self, ppo_agent=None, num_tiles: int = None, force_interval: int = 10):
         self.ppo_agent = ppo_agent
         self.num_tiles = num_tiles
-        self.force_double_precision_episodes = force_double_precision_episodes
+        self.force_interval = force_interval  # 每多少个episode强制一次双精度
         self.episode_count = 0
-        self.is_first_episode = True
-        self.first_episode_stats = None
-        self.first_episode_started = False
+        self.is_force_dp_episode = True
+        self.force_episode_stats = None
+        self.force_episode_started = False
+
+        # 如果没有提供ppo_agent，说明这是一个纯双精度代理
+        if ppo_agent is None:
+            self.is_force_dp_episode = True  # 总是强制双精度
 
         # 添加 tile_agents 属性，指向底层代理的 tile_agents
-        self.tile_agents = ppo_agent.tile_agents if hasattr(ppo_agent, 'tile_agents') else []
+        self.tile_agents = ppo_agent.tile_agents if hasattr(ppo_agent, 'tile_agents') and ppo_agent is not None else []
 
     def act(self, obs):
-        """在第一个 episode 强制使用双精度动作"""
-        if self.is_first_episode:
-            # 第一个 episode 强制使用 fp64 (动作 0)
+        """在指定的episode间隔强制使用双精度动作"""
+        if self.is_force_dp_episode or self.ppo_agent is None:
+            # 强制双精度episode或纯双精度代理使用 fp64 (动作 0)
             return [0] * self.num_tiles
         else:
-            # 后续 episodes 使用 PPO 代理的动作
+            # 正常episodes使用 PPO 代理的动作
             return self.ppo_agent.act(obs)
 
     def observe(self, obs, reward, done, reset):
-        """观察转换，第一个 episode 不记录到 PPO 缓冲区"""
-        # 只有在非第一个 episode 时才记录数据到 PPO 代理
-        if not self.is_first_episode:
+        """观察转换，强制双精度episode不记录到PPO缓冲区"""
+        # 如果是纯双精度代理，不需要记录任何观察
+        if self.ppo_agent is None:
+            return
+
+        # 只有在非强制双精度episode时才记录数据到PPO代理
+        if not self.is_force_dp_episode:
             # 正常观察
             self.ppo_agent.observe(obs, reward, done, reset)
 
-            if reset:
+            if done:
                 self.episode_count += 1
-        elif done and self.is_first_episode:
-            # 第一个 episode 结束，切换到正常模式
-            self.is_first_episode = False
+                # 检查当前episode是否应该是强制双精度episode
+                if self.episode_count % self.force_interval == 0:
+                    self.is_force_dp_episode = True
+        elif done and self.is_force_dp_episode:
+            # 强制双精度episode结束，切换到正常模式
+            self.is_force_dp_episode = False
             self.episode_count += 1
 
-    def start_first_episode(self):
-        """标记第一个 episode 开始"""
-        self.first_episode_started = True
+    def start_force_episode(self):
+        """标记强制双精度episode开始"""
+        self.force_episode_started = True
 
     def save(self, path):
         """保存 PPO 代理"""
@@ -161,9 +172,9 @@ def run_double_precision_episode_with_agent(env: CGEnvironment, agent) -> Dict:
     """
     print("=== 运行双精度 episode 来确定合适的 max_iter ===")
 
-    # 如果是包装器代理，标记第一个 episode 开始
-    if hasattr(agent, 'start_first_episode'):
-        agent.start_first_episode()
+    # 如果是包装器代理，标记强制双精度episode开始
+    if hasattr(agent, 'start_force_episode'):
+        agent.start_force_episode()
 
     # 重置环境开始 episode
     obs = env.reset()
@@ -232,8 +243,8 @@ def train_cg_ppo(config: Dict):
     tilesize = env.spmv_sim.tilesize
     num_tiles = (env.matrix_size + tilesize - 1) // tilesize
 
-    # 使用包装器包装 PPO 代理，在第一个 episode 强制使用双精度
-    wrapped_agent = DoublePrecisionWrapperAgent(cg_agent, num_tiles)
+    # 使用包装器包装 PPO 代理，每10个episode强制使用一次双精度
+    wrapped_agent = DoublePrecisionWrapperAgent(cg_agent, num_tiles, force_interval=10)
 
     # 确保 PPO 代理处于训练模式
     for tile_agent in cg_agent.tile_agents:
@@ -244,16 +255,17 @@ def train_cg_ppo(config: Dict):
     from agent.ppo_agent_factory import PfrlCompatibleCGPPOAgent
     agent = PfrlCompatibleCGPPOAgent(wrapped_agent)
 
-    # 运行双精度 episode 来确定合适的 max_iter（这个 episode 的数据会进入 PPO 的缓冲区）
+    # 运行初始双精度 episode 来确定合适的 max_iter
     dp_result = run_double_precision_episode_with_agent(env, wrapped_agent)
 
-    # 更新 max_iter 为收敛 iterations 的 1.5 倍
+    # 更新 max_iter 为收敛 iterations 的 2 倍
     original_max_iter = config['cg']['max_iter']
-    new_max_iter = int(dp_result['iterations'] * 1.5)
-    config['cg']['max_iter'] = max(new_max_iter, 10)  # 至少设置为 10
+    # new_max_iter = int(dp_result['iterations'] * 2)
+    # config['cg']['max_iter'] = max(new_max_iter, 10)  # 至少设置为 10
 
     print(f"更新 max_iter: {original_max_iter} -> {config['cg']['max_iter']}")
     print(f"双精度基准计算成本: {dp_result['compute_cost']:.6f}")
+    print(f"每 {wrapped_agent.force_interval} 个episode将强制运行一次双精度episode以确保收敛")
 
     # 重新创建环境（使用更新后的 max_iter）
     env_config = create_env_config(config)
@@ -354,7 +366,7 @@ def final_evaluation(log_dir: str, config: Dict):
 
     # 1. 双精度 baseline 评估
     print("\n📊 运行双精度 baseline 评估...")
-    dp_agent = DoublePrecisionWrapperAgent(num_tiles)
+    dp_agent = DoublePrecisionWrapperAgent(num_tiles=num_tiles)  # 纯双精度代理
     dp_result = run_double_precision_episode_with_agent(env, dp_agent)
 
     # 2. 训练后模型评估
