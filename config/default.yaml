@@ -1,8 +1,8 @@
 cg:
-  max_iter: 500
+  max_iter: 1000
   stop_tol: 1e-10
   matrix_size: 512  # 矩阵大小 (n x n)，当使用真实矩阵时会被覆盖
-  matrix_name: None  # 矩阵名称，从 matrix_set.csv 中选择， Muu(7102), minsurfo(40806, model不收敛), mesh3e1(289), qa8fm(66127), thermomech_TC(102158, unknown)
+  matrix_name: Muu  # 矩阵名称，从 matrix_set.csv 中选择， Muu(7102), minsurfo(40806, model不收敛), mesh3e1(289), qa8fm(66127), thermomech_TC(102158, unknown)
   matrix_data_dir: ~/data/matrix  # 矩阵数据目录
   matrix_set_csv: matrix_set.csv  # 矩阵信息CSV文件
 
@@ -24,21 +24,21 @@ ppo:
   gamma: 0.99                # 折扣因子
   learning_rate: 3e-4        # 学习率，降低可提高稳定性
   n_epochs: 10               # 每次更新时训练所有数据的轮数
-  batch_size: 128            # 每个更新周期的小批量样本数
+  batch_size: 64            # 每个更新周期的小批量样本数
   clip_range: 0.2            # PPO策略损失裁剪参数ε
   value_coef: 0.5            # value function 损失的权重
-  entropy_coef: 0.03         # 熵奖励系数，鼓励探索
+  entropy_coef: 0.01         # 熵奖励系数，鼓励探索
   gpu: 0                     # 使用 GPU 0
   update_interval: 10        # 网络参数每隔多少步更新一次
   hidden_sizes: [64, 64]     # 神经网络隐藏层大小列表, 如[64,64]为两层每层64单元
   max_grad_norm: 0.5         # 梯度裁剪最大范数
 
 train:
-  total_steps: 10000
-  eval_interval: 500
+  total_steps: 20000
+  eval_interval: 1000
+  eval_n_episodes: 5
   save_interval: 1000
-  log_interval: 1000
-  num_envs: 1
+  force_interval: 10
 
 env:
   normalize_state: true

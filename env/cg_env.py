@@ -90,6 +90,7 @@ class CGEnvironment:
         self.Ap = None  # A*p 向量
         self.b = None  # 右端项
         self.b_norm = None  # 右端项范数
+        self.initial_residual_norm = None  # 初始残差
 
         # 矩阵数据缓存
         self.A_matrix = None  # scipy csr_matrix
@@ -278,6 +279,9 @@ class CGEnvironment:
 
         # 预先计算tile块（性能优化）
         self._precompute_tile_blocks()
+
+        # 转换为 BSR 格式（用于 TileLang kernel）
+        self.bsr_data, self.bsr_indices, self.bsr_indptr, self.bsr_R, self.bsr_C = self._convert_matrix_to_bsr()
 
         self.matrix_loaded = True
         return A_diagonal, b
@@ -567,9 +571,9 @@ class CGEnvironment:
         self.p = self.r.copy()  # p0 = r0
 
         # 记录初始残差
-        initial_residual_norm = self.math_sim.vector_norm(self.r)
+        self.initial_residual_norm = self.math_sim.vector_norm(self.r)
         self.residual_tracker.reset()
-        self.residual_tracker.record_residual(initial_residual_norm)
+        self.residual_tracker.record_residual(self.initial_residual_norm)
 
         # 重置轨迹跟踪
         self.episode_cpt_cost = 0.0
@@ -636,6 +640,8 @@ class CGEnvironment:
 
         # 使用 TileLang kernel 执行 SpMV 计算
         # time_start = time.time()
+        
+        # 真实 kernel 版本
         self.Ap = bsr_spmv_mixed(
             self.bsr_data, actions_np, self.bsr_indices, self.bsr_indptr,
             self.p, self.bsr_R, self.bsr_C, device="cuda"
@@ -644,6 +650,19 @@ class CGEnvironment:
         # 裁剪 self.Ap 到实际矩阵大小，去掉 padding 的计算结果
         if len(self.Ap) > self.matrix_size:
             self.Ap = self.Ap[:self.matrix_size]
+            
+        # 仿真版本
+        # for tile_idx in range(num_tiles):
+        #     start_idx = tile_idx * tilesize
+        #     actual_tilesize = min(tilesize, self.matrix_size - start_idx)
+        #     end_idx = start_idx + actual_tilesize
+        #     # 使用预计算的tile块
+        #     matrix_block = self.tile_blocks[tile_idx]
+        #     # 模拟该 tile 的 SpMV 计算
+        #     action = actions[tile_idx]
+        #     partial_result, cpt_cost = self.spmv_sim.simulate_spmv_block(matrix_block, self.p, action)
+        #     # 累加到 Ap 向量（使用numpy切片操作）
+        #     self.Ap[start_idx:end_idx] += partial_result[:actual_tilesize]
         
         # time_end = time.time()
         # iteration_compute_time = (time_end - time_start)*1000
@@ -679,7 +698,21 @@ class CGEnvironment:
         self.performance_stats['cg_math_time'] += (cg_math_end_time - cg_math_start_time)
 
         # 计算当前迭代的奖励
-        iteration_reward = self.w1 * (-math.log(residual_norm/self.b_norm, 10)) - self.w2 * (iteration_cpt_cost/num_tiles) + self.w3 * converged
+        # 如果到达最大迭代步数但仍未收敛，加惩罚
+        if self.current_iteration + 1 >= self.max_iter and not converged:
+            # 给予较大惩罚（如 -self.w3 * self.max_iter）
+            iteration_reward = (
+                self.w1 * (-math.log(residual_norm/self.initial_residual_norm, 10))
+                - self.w2 * (iteration_cpt_cost/num_tiles)
+                - self.max_iter  # 强惩罚
+            )
+            print(f"未收敛惩罚: {-self.max_iter}")
+        else:
+            iteration_reward = (
+                self.w1 * (-math.log(residual_norm/self.initial_residual_norm, 10))
+                - self.w2 * (iteration_cpt_cost/num_tiles)
+                + self.w3 * converged * (self.max_iter - self.current_iteration)/10
+            )
 
         if self.current_iteration % 10 == 0 or converged:
             print("")
@@ -688,7 +721,7 @@ class CGEnvironment:
             print(f"当前迭代残差: {residual_norm}")
             print(f"当前迭代每tile平均计算成本: {iteration_cpt_cost/num_tiles}")
             print(f"当前迭代是否收敛: {converged}")
-            print(f"残差下降奖励: {self.w1 * (-math.log(residual_norm/self.b_norm, 10))}")
+            print(f"残差下降奖励: {self.w1 * (-math.log(residual_norm/self.initial_residual_norm, 10))}")
             print(f"计算成本奖励: {-self.w2 * (iteration_cpt_cost/num_tiles)}")
             print(f"收敛奖励: {self.w3 * converged}")
             print(f"总奖励: {iteration_reward}")

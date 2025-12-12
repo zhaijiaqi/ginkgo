@@ -8,6 +8,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+import copy
 import yaml
 import numpy as np
 import torch
@@ -75,7 +76,7 @@ def extract_train_config(config: Dict) -> Dict:
         'total_steps': train_config.get('total_steps', 10000),
         'eval_interval': train_config.get('eval_interval', 1000),
         'save_interval': train_config.get('save_interval', 1000),
-        'log_interval': train_config.get('log_interval', 1000)
+        'eval_n_episodes': train_config.get('eval_n_episodes', 5)
     }
 
 
@@ -113,7 +114,12 @@ class DoublePrecisionWrapperAgent:
         if self.ppo_agent is None:
             return
 
-        # 只有在非强制双精度episode时才记录数据到PPO代理
+        # 评估阶段不执行强制双精度逻辑，直接调用底层代理的observe
+        if not self.training:
+            self.ppo_agent.observe(obs, reward, done, reset)
+            return
+
+        # 训练阶段：只有在非强制双精度episode时才记录数据到PPO代理
         if not self.is_force_dp_episode:
             # 正常观察
             self.ppo_agent.observe(obs, reward, done, reset)
@@ -244,7 +250,8 @@ def train_cg_ppo(config: Dict):
     num_tiles = (env.matrix_size + tilesize - 1) // tilesize
 
     # 使用包装器包装 PPO 代理，每10个episode强制使用一次双精度
-    wrapped_agent = DoublePrecisionWrapperAgent(cg_agent, num_tiles, force_interval=10)
+    force_interval = config.get('train', {}).get('force_interval', 50)
+    wrapped_agent = DoublePrecisionWrapperAgent(cg_agent, num_tiles, force_interval=force_interval)
 
     # 确保 PPO 代理处于训练模式
     for tile_agent in cg_agent.tile_agents:
@@ -260,8 +267,8 @@ def train_cg_ppo(config: Dict):
 
     # 更新 max_iter 为收敛 iterations 的 2 倍
     original_max_iter = config['cg']['max_iter']
-    # new_max_iter = int(dp_result['iterations'] * 2)
-    # config['cg']['max_iter'] = max(new_max_iter, 10)  # 至少设置为 10
+    new_max_iter = int(dp_result['iterations'] * 2)
+    config['cg']['max_iter'] = max(new_max_iter, 10)  # 至少设置为 10
 
     print(f"更新 max_iter: {original_max_iter} -> {config['cg']['max_iter']}")
     print(f"双精度基准计算成本: {dp_result['compute_cost']:.6f}")
@@ -296,7 +303,7 @@ def train_cg_ppo(config: Dict):
             env=env,
             steps=train_params['total_steps'],
             eval_n_steps=None,  # 不限制每次评估的步数
-            eval_n_episodes=2,  # 每次评估运行10个episode
+            eval_n_episodes=train_params['eval_n_episodes'],  # 每次评估运行eval_n_episodes个episode
             eval_interval=train_params['eval_interval'],
             outdir=log_dir,
             checkpoint_freq=train_params['save_interval'],  # 定期保存检查点
@@ -441,15 +448,94 @@ def final_evaluation(log_dir: str, config: Dict):
 
 def main():
     """主函数"""
+    import argparse
+
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description='CG PPO训练脚本')
+    parser.add_argument('--config', type=str, default='config/default.yaml',
+                       help='配置文件路径 (默认: config/default.yaml)')
+    parser.add_argument('--single-matrix', action='store_true',
+                       help='单矩阵训练模式：只训练配置文件中指定的矩阵')
+    parser.add_argument('--matrix-name', type=str,
+                       help='指定要训练的矩阵名称（覆盖配置文件中的设置）')
+
+    args = parser.parse_args()
+
     # 加载配置
-    config_path = 'config/default.yaml'
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+    try:
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"错误: 找不到配置文件 {args.config}")
+        return
 
-    # 开始训练
-    log_dir = train_cg_ppo(config)
+    # 单矩阵训练模式
+    if args.single_matrix or args.matrix_name:
+        if args.matrix_name:
+            # 使用命令行指定的矩阵名称
+            config['cg']['matrix_name'] = args.matrix_name
 
-    print(f"\n🎉 训练完成! 结果保存至: {log_dir}")
+        matrix_name = config['cg']['matrix_name']
+        print(f"🚀 单矩阵训练模式: {matrix_name}")
+
+        try:
+            log_dir = train_cg_ppo(config)
+            print(f"✅ 矩阵 {matrix_name} 训练完成! 结果保存至: {log_dir}")
+        except Exception as e:
+            print(f"❌ 矩阵 {matrix_name} 训练失败: {e}")
+            import traceback
+            traceback.print_exc()
+        return
+
+    # 批量训练模式（原来的逻辑）
+    print("🔄 批量训练模式：从valid_matrix_set.csv读取所有矩阵")
+
+    # 从 valid_matrix_set.csv 读取矩阵名称列表
+    matrix_csv_path = 'valid_matrix_set.csv'
+    matrix_names = []
+
+    try:
+        with open(matrix_csv_path, 'r') as csv_file:
+            # 跳过第一行标题
+            next(csv_file)
+            for line in csv_file:
+                if line.strip():  # 跳过空行
+                    parts = line.strip().split(',')
+                    if len(parts) >= 3:  # 确保有足够的列
+                        matrix_names.append(parts[2])  # Name 列是第3列（索引2）
+    except FileNotFoundError:
+        print(f"警告: 找不到文件 {matrix_csv_path}，将使用配置文件中的单个矩阵")
+        matrix_names = [config['cg']['matrix_name']]
+
+    print(f"📋 发现 {len(matrix_names)} 个矩阵需要训练:")
+    for i, name in enumerate(matrix_names, 1):
+        print(f"  {i}. {name}")
+
+    # 对每个矩阵进行训练
+    all_log_dirs = []
+    for i, matrix_name in enumerate(matrix_names, 1):
+        print(f"\n{'='*60}")
+        print(f"🚀 开始训练矩阵 {i}/{len(matrix_names)}: {matrix_name}")
+        print(f"{'='*60}")
+
+        # 创建当前矩阵的配置副本
+        current_config = copy.deepcopy(config)
+        current_config['cg']['matrix_name'] = matrix_name
+
+        # 开始训练
+        try:
+            log_dir = train_cg_ppo(current_config)
+            all_log_dirs.append(log_dir)
+            print(f"✅ 矩阵 {matrix_name} 训练完成! 结果保存至: {log_dir}")
+        except Exception as e:
+            print(f"❌ 矩阵 {matrix_name} 训练失败: {e}")
+            continue
+
+    print(f"\n🎉 所有矩阵训练完成! 共训练了 {len(all_log_dirs)}/{len(matrix_names)} 个矩阵")
+    if all_log_dirs:
+        print("训练结果保存目录:")
+        for log_dir in all_log_dirs:
+            print(f"  - {log_dir}")
 
 
 if __name__ == "__main__":

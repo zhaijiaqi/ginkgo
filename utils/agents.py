@@ -92,7 +92,7 @@ class FullFp8Agent:
 
     def act(self, obs):
         """总是返回 fp8 动作 (5)"""
-        return [5] * self.num_tiles  # 5 = fp8
+        return [3] * self.num_tiles  # 3 = fp8
 
     def observe(self, obs, reward, done, reset):
         """什么都不做"""
