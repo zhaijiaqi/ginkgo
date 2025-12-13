@@ -28,17 +28,17 @@ ppo:
   clip_range: 0.2            # PPO策略损失裁剪参数ε
   value_coef: 0.5            # value function 损失的权重
   entropy_coef: 0.01         # 熵奖励系数，鼓励探索
-  gpu: 0                     # 使用 GPU 0
+  gpu: 0                    # GPU设备编号，-1表示自动选择可用GPU
   update_interval: 10        # 网络参数每隔多少步更新一次
   hidden_sizes: [64, 64]     # 神经网络隐藏层大小列表, 如[64,64]为两层每层64单元
   max_grad_norm: 0.5         # 梯度裁剪最大范数
 
 train:
-  total_steps: 20000
+  total_episodes: 1000
   eval_interval: 1000
   eval_n_episodes: 5
   save_interval: 1000
-  force_interval: 10
+  force_interval: 1000  # 每1000个episode强制使用一次双精度，相当于只在开头使用
 
 env:
   normalize_state: true

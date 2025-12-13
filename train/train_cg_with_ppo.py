@@ -106,8 +106,13 @@ def extract_train_config(config: Dict) -> Dict:
         训练参数字典
     """
     train_config = config.get('train', {})
+    max_iter = config.get('cg', {}).get('max_iter', 1000)
+    total_episodes = train_config.get('total_episodes', 1000)
+    total_steps = total_episodes * max_iter
+
     return {
-        'total_steps': train_config.get('total_steps', 10000),
+        'total_steps': total_steps,
+        'total_episodes': total_episodes,
         'eval_interval': train_config.get('eval_interval', 1000),
         'save_interval': train_config.get('save_interval', 1000),
         'eval_n_episodes': train_config.get('eval_n_episodes', 5)
@@ -502,6 +507,8 @@ def main():
                        help='单矩阵训练模式：只训练配置文件中指定的矩阵')
     parser.add_argument('--matrix-name', type=str,
                        help='指定要训练的矩阵名称（覆盖配置文件中的设置）')
+    parser.add_argument('--gpu', type=int,
+                       help='指定使用的GPU设备编号 (默认: 0, 自动选择)')
 
     args = parser.parse_args()
 
@@ -512,6 +519,17 @@ def main():
     except FileNotFoundError:
         print(f"错误: 找不到配置文件 {args.config}")
         return
+
+    # 根据命令行参数设置GPU
+    if args.gpu is not None:
+        config['ppo']['gpu'] = args.gpu
+        print(f"使用指定的GPU设备: {args.gpu}")
+    else:
+        gpu_setting = config['ppo'].get('gpu', 0)
+        if gpu_setting == -1:
+            print("GPU设置为自动选择模式")
+        else:
+            print(f"使用配置文件中的GPU设备: {gpu_setting}")
 
     # 单矩阵训练模式
     if args.single_matrix or args.matrix_name:
@@ -532,10 +550,10 @@ def main():
         return
 
     # 批量训练模式（原来的逻辑）
-    print("🔄 批量训练模式：从valid_matrix_set.csv读取所有矩阵")
+    print("🔄 批量训练模式：从cg_results.csv读取所有矩阵")
 
-    # 从 valid_matrix_set.csv 读取矩阵名称列表
-    matrix_csv_path = 'valid_matrix_set.csv'
+    # 从 cg_results.csv 读取矩阵名称列表
+    matrix_csv_path = 'cg_results.csv'
     matrix_names = []
 
     try:

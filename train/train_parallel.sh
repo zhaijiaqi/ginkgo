@@ -1,18 +1,26 @@
 #!/bin/bash
 
-# 并行训练脚本：同时至多运行10个CG PPO训练任务
+# 并行训练脚本：分批运行CG PPO训练任务，每次最多12个并发（4张GPU，每张GPU平均3个任务）
 # 用法: ./train_parallel.sh [矩阵名称1] [矩阵名称2] ...
-# 如果不提供参数，则从valid_matrix_set.csv读取所有矩阵
+# 如果不提供参数，则从cg_results.csv读取所有矩阵
 
 set -e  # 遇到错误立即退出
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TRAIN_SCRIPT="${PROJECT_ROOT}/train/train_cg_with_ppo.py"
-MATRIX_CSV="${PROJECT_ROOT}/valid_matrix_set.csv"
+MATRIX_CSV="${PROJECT_ROOT}/cg_results.csv"
 CONFIG_FILE="${PROJECT_ROOT}/config/default.yaml"
 
-# 默认并发数
-MAX_JOBS=10
+# 默认并发数：4张GPU，每张GPU训练3个数据集
+MAX_JOBS=12
+NUM_GPUS=4  # 可用的GPU数量
+
+# GPU分配策略：确保每个GPU分配的任务数量更均衡
+get_gpu_for_task() {
+    local task_index="$1"
+    # 简单的轮询分配：0->0, 1->1, 2->2, 3->3, 4->0, 5->1, ...
+    echo $((task_index % NUM_GPUS))
+}
 
 # 日志函数
 log_info() {
@@ -57,15 +65,16 @@ read_matrix_names() {
 train_single_matrix() {
     local matrix_name="$1"
     local job_id="$2"
+    local gpu_id="$3"
 
-    log_info "[$job_id] 开始训练矩阵: $matrix_name"
+    log_info "[$job_id] 开始训练矩阵: $matrix_name (GPU: $gpu_id)"
 
     # 创建临时配置文件
     local temp_config="/tmp/train_config_${matrix_name}_$$.yaml"
     sed "s/matrix_name: .*/matrix_name: $matrix_name/" "$CONFIG_FILE" > "$temp_config"
 
-    # 运行训练
-    if python3 "$TRAIN_SCRIPT" --config "$temp_config" --single-matrix; then
+    # 设置CUDA_VISIBLE_DEVICES来强制使用特定GPU，然后运行训练
+    if CUDA_VISIBLE_DEVICES="$gpu_id" python3 "$TRAIN_SCRIPT" --config "$temp_config" --single-matrix --gpu 0; then
         log_info "[$job_id] 矩阵 $matrix_name 训练成功完成"
         rm -f "$temp_config"
         return 0
@@ -104,67 +113,101 @@ main() {
     local total_matrices=${#matrix_names[@]}
     log_info "发现 $total_matrices 个矩阵需要训练: ${matrix_names[*]}"
     log_info "最大并发数: $MAX_JOBS"
+    log_info "可用GPU数量: $NUM_GPUS"
 
-    local completed_jobs=0
-    local failed_jobs=0
+    # 分批启动训练任务，每次最多启动MAX_JOBS个任务
+    log_info "分批启动 $total_matrices 个训练进程，每次最多 $MAX_JOBS 个并发..."
+    log_info "每个GPU将平均分配约 $((MAX_JOBS / NUM_GPUS)) 个任务"
+    log_info "GPU分配策略: 循环分配给 $NUM_GPUS 张GPU"
 
-    # 首先启动尽可能多的job（最多MAX_JOBS个）
-    local jobs_to_start=$((total_matrices < MAX_JOBS ? total_matrices : MAX_JOBS))
-    log_info "同时启动 $jobs_to_start 个训练进程..."
+    local pids=()
+    local result_files=()
 
-    for i in $(seq 0 $((jobs_to_start - 1))); do
+    # 创建临时目录用于存储任务结果
+    local temp_dir="/tmp/rlcg_training_$$"
+    mkdir -p "$temp_dir"
+
+    # 分批启动任务，每次最多启动MAX_JOBS个任务
+    for i in $(seq 0 $((total_matrices - 1))); do
         local matrix_name="${matrix_names[$i]}"
         local job_id=$((i + 1))
+        local gpu_id=$(get_gpu_for_task "$i")  # 使用函数分配GPU
+        local result_file="$temp_dir/job_${job_id}.result"
 
-        # 启动后台训练任务
-        {
-            if train_single_matrix "$matrix_name" "$job_id"; then
-                ((completed_jobs++))
-            else
-                ((failed_jobs++))
-            fi
-        } &
-
-        log_info "[$job_id] 已启动训练任务: $matrix_name"
-    done
-
-    local next_matrix_index=$jobs_to_start
-
-    # 当还有矩阵需要训练时，持续监控并启动新job
-    while [ $next_matrix_index -lt $total_matrices ]; do
         # 等待有空闲slot
-        while [ "$(jobs -r | wc -l)" -ge $MAX_JOBS ]; do
-            sleep 2  # 每2秒检查一次
-        done
+        wait_for_slot "$MAX_JOBS"
 
-        # 启动下一个job
-        local matrix_name="${matrix_names[$next_matrix_index]}"
-        local job_id=$((next_matrix_index + 1))
+        # 启动后台训练任务（GPU分配在train_single_matrix函数中处理）
+        train_single_matrix "$matrix_name" "$job_id" "$gpu_id" &
+        local pid=$!
+        pids[$i]=$pid
 
-        # 启动后台训练任务
-        {
-            if train_single_matrix "$matrix_name" "$job_id"; then
-                ((completed_jobs++))
-            else
-                ((failed_jobs++))
-            fi
-        } &
-
-        log_info "[$job_id] 已启动训练任务: $matrix_name"
-        ((next_matrix_index++))
+        log_info "[$job_id] 已启动训练任务: $matrix_name (GPU: $gpu_id, PID: $pid)"
     done
 
-    # 等待最后一批任务完成
+    # 显示当前运行状态
+    log_info "所有任务已启动，开始监控执行状态..."
+    log_info "运行中的任务数: $(jobs -r | wc -l)"
+
+    # 等待所有任务完成
     log_info "等待所有训练任务完成..."
-    wait
+    local start_time=$(date +%s)
+    local last_report_time=$start_time
+
+    while true; do
+        local running_count=$(jobs -r | wc -l)
+        local current_time=$(date +%s)
+        local elapsed=$((current_time - start_time))
+
+        # 每30秒报告一次进度
+        if [ $((current_time - last_report_time)) -ge 30 ]; then
+            log_info "训练进行中... 已运行 ${elapsed}秒，剩余运行任务: $running_count"
+            last_report_time=$current_time
+        fi
+
+        # 检查是否所有任务都完成了
+        if [ $running_count -eq 0 ]; then
+            break
+        fi
+
+        sleep 5
+    done
+
+    # 确保所有后台进程都已终止
+    for pid in "${pids[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
 
     # 统计结果
-    local final_running=$(jobs -r | wc -l)
-    log_info "训练完成统计:"
+    local completed_jobs=0
+    local failed_jobs=0
+    local total_time=$(($(date +%s) - start_time))
+
+    log_info "收集训练结果..."
+    for result_file in "$temp_dir"/*.result; do
+        if [ -f "$result_file" ]; then
+            local result=$(cat "$result_file")
+            if [[ $result == success:* ]]; then
+                ((completed_jobs++))
+            elif [[ $result == failed:* ]]; then
+                ((failed_jobs++))
+            fi
+        fi
+    done
+
+    # 清理临时目录
+    rm -rf "$temp_dir"
+
+    log_info "🎯 训练完成统计:"
     log_info "  总矩阵数: $total_matrices"
     log_info "  成功完成: $completed_jobs"
     log_info "  失败数量: $failed_jobs"
-    log_info "  运行中: $final_running"
+    log_info "  总耗时: ${total_time}秒"
+    log_info "  平均每个矩阵耗时: $((total_time / total_matrices))秒"
+    log_info "  GPU数量: $NUM_GPUS"
+    log_info "  设计并发数: $MAX_JOBS"
 
     if [ $failed_jobs -eq 0 ]; then
         log_info "🎉 所有训练任务成功完成!"
@@ -178,19 +221,19 @@ main() {
 # 显示用法
 show_usage() {
     cat << EOF
-并行训练脚本：同时至多运行10个CG PPO训练任务
+并行训练脚本：同时至多运行12个CG PPO训练任务（4张GPU，每张GPU训练3个数据集）
 
 用法:
-  $0                    # 从valid_matrix_set.csv读取所有矩阵并训练
+  $0                    # 从cg_results.csv读取所有矩阵并训练
   $0 matrix1 matrix2    # 只训练指定的矩阵
   $0 --help             # 显示此帮助信息
 
 选项:
   --help          显示此帮助信息
-  --max-jobs N    设置最大并发数 (默认: 10)
+  --max-jobs N    设置最大并发数 (默认: 12)
 
 示例:
-  $0                          # 训练所有矩阵，最多10个并发
+  $0                          # 训练所有矩阵，最多12个并发
   $0 bcsstk09 Muu            # 只训练bcsstk09和Muu两个矩阵
   $0 --max-jobs 4 bcsstk09   # 最多4个并发，训练bcsstk09
 
