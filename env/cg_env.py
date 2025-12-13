@@ -897,6 +897,4 @@ class CGEnvironment:
             'converged': converged,  # 使用0/1而不是False/True
             'total_cost': total_cost,
             'avg_tile_cost': avg_tile_cost,
-            'residual_history': residual_history,
-            'step_rewards': self.step_rewards.copy() if self.step_rewards else []
-        }
+            'residual_history': residua

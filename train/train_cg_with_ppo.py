@@ -35,6 +35,40 @@ utils_spec.loader.exec_module(utils)
 from utils import TrainingLogger, TrainingStatsHook, EvalHook, convert_to_serializable
 
 
+def load_initial_x0(env_config: Dict, matrix_name: Optional[str], matrix_size: Optional[int]) -> Optional[np.ndarray]:
+    """
+    加载初始 x_0，如果加载失败则返回 None（使用默认的全1向量）
+
+    Args:
+        env_config: 环境配置
+        matrix_name: 矩阵名称
+        matrix_size: 矩阵大小
+
+    Returns:
+        initial_x: 初始解向量，如果加载失败返回 None
+    """
+    # 构建 x_0 文件路径（与矩阵文件在同一目录）
+    matrix_data_dir = os.path.expanduser(env_config.get('matrix_data_dir', '~/data/matrix'))
+    if matrix_name is not None and matrix_name != "None":
+        x0_filename = f"{matrix_name}_x0.npy"
+    else:
+        x0_filename = f"random_{matrix_size}_x0.npy"
+    x0_path = os.path.join(matrix_data_dir, x0_filename)
+
+    if os.path.exists(x0_path):
+        try:
+            # 加载 x_0 文件
+            initial_x = np.load(x0_path, allow_pickle=True)
+            print(f"📂 已加载初始 x_0 文件: {x0_path}，形状: {initial_x.shape}")
+            return initial_x
+        except Exception as e:
+            print(f"⚠️ 加载 x_0 文件失败: {x0_path}，错误: {e}，将使用默认初始值")
+            return None
+    else:
+        print(f"📂 未找到 x_0 文件: {x0_path}，将使用默认初始值")
+        return None
+
+
 def create_env_config(config: Dict) -> Dict:
     """
     从训练配置创建环境配置
@@ -165,7 +199,7 @@ class DoublePrecisionWrapperAgent:
         return self.ppo_agent.saved_attributes
 
 
-def run_double_precision_episode_with_agent(env: CGEnvironment, agent) -> Dict:
+def run_double_precision_episode_with_agent(env: CGEnvironment, agent, initial_x: Optional[np.ndarray] = None) -> Dict:
     """
     使用给定的代理运行双精度 episode 来确定合适的 max_iter
 
@@ -183,7 +217,7 @@ def run_double_precision_episode_with_agent(env: CGEnvironment, agent) -> Dict:
         agent.start_force_episode()
 
     # 重置环境开始 episode
-    obs = env.reset()
+    obs = env.reset(initial_x=initial_x)
     done = False
     total_reward = 0.0
     step_count = 0
@@ -249,6 +283,11 @@ def train_cg_ppo(config: Dict):
     tilesize = env.spmv_sim.tilesize
     num_tiles = (env.matrix_size + tilesize - 1) // tilesize
 
+    # 加载初始 x_0
+    matrix_name = config.get('cg', {}).get('matrix_name')
+    matrix_size = config.get('cg', {}).get('matrix_size')
+    initial_x = load_initial_x0(env_config, matrix_name, matrix_size)
+
     # 使用包装器包装 PPO 代理，每10个episode强制使用一次双精度
     force_interval = config.get('train', {}).get('force_interval', 50)
     wrapped_agent = DoublePrecisionWrapperAgent(cg_agent, num_tiles, force_interval=force_interval)
@@ -263,7 +302,7 @@ def train_cg_ppo(config: Dict):
     agent = PfrlCompatibleCGPPOAgent(wrapped_agent)
 
     # 运行初始双精度 episode 来确定合适的 max_iter
-    dp_result = run_double_precision_episode_with_agent(env, wrapped_agent)
+    dp_result = run_double_precision_episode_with_agent(env, wrapped_agent, initial_x=initial_x)
 
     # 更新 max_iter 为收敛 iterations 的 2 倍
     original_max_iter = config['cg']['max_iter']
@@ -371,10 +410,15 @@ def final_evaluation(log_dir: str, config: Dict):
 
     print(f"评估环境: 矩阵大小 {env.matrix_size}x{env.matrix_size}, tile 数量 {num_tiles}")
 
+    # 加载初始 x_0
+    matrix_name = config.get('cg', {}).get('matrix_name')
+    matrix_size = config.get('cg', {}).get('matrix_size')
+    initial_x = load_initial_x0(env_config, matrix_name, matrix_size)
+
     # 1. 双精度 baseline 评估
     print("\n📊 运行双精度 baseline 评估...")
     dp_agent = DoublePrecisionWrapperAgent(num_tiles=num_tiles)  # 纯双精度代理
-    dp_result = run_double_precision_episode_with_agent(env, dp_agent)
+    dp_result = run_double_precision_episode_with_agent(env, dp_agent, initial_x=initial_x)
 
     # 2. 训练后模型评估
     print("\n🤖 运行训练后模型评估...")
@@ -389,7 +433,7 @@ def final_evaluation(log_dir: str, config: Dict):
     pfrl_agent = PfrlCompatibleCGPPOAgent(cg_agent)
 
     # 运行评估 episode
-    obs = env.reset()
+    obs = env.reset(initial_x=initial_x)
     done = False
     trained_cost = 0.0
     step_count = 0

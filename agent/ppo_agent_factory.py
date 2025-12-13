@@ -257,6 +257,12 @@ class CGPPOAgent:
         for tile_agent in self.tile_agents:
             tile_agent.eval_mode()
 
+    @property
+    def training(self):
+        """是否处于训练模式"""
+        # 返回第一个代理的训练状态（所有代理状态应该一致）
+        return self.tile_agents[0].training if self.tile_agents else False
+
 
 
 

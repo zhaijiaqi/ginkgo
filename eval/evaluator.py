@@ -67,7 +67,7 @@ def run_episode_with_agent(env: CGEnvironment, agent, seed: int = 42,
         env.b_norm = np.linalg.norm(env.b)
         # 重新计算初始残差
         env.x = np.zeros(env.matrix_size)
-        env.r = env._compute_exact_residual(env.x, env.A_diagonal, env.b)
+        env.r = env._compute_exact_residual(env.x, env.A_matrix, env.b)
         env.p = env.r.copy()
         # 重新记录初始残差
         initial_residual_norm = env.math_sim.vector_norm(env.r)

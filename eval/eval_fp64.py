@@ -17,7 +17,7 @@ import json
 import argparse
 import random
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 # 导入项目模块
 from env.cg_env import CGEnvironment
@@ -68,6 +68,9 @@ def run_fp64_evaluation(matrix_name: Optional[str] = None,
     # 创建环境
     print("\n📊 创建评估环境...")
     env = CGEnvironment(env_config)
+    
+    print(f"env.x: {env.x[:10]}")
+    print(f"env.b: {env.b[:10]}")
 
     # 计算 tile 数量
     tilesize = env.spmv_sim.tilesize
@@ -150,10 +153,14 @@ def run_fp64_evaluation(matrix_name: Optional[str] = None,
             'runtime_seconds': runtime
         }
     }
-
+    
+    
     # 保存结果到JSON文件
-    result_filename = f"fp64_evaluation_result_{int(time.time())}.json"
-    result_path = os.path.join('.', result_filename)
+    result_dir = './log/fp64/'
+    if not os.path.exists(result_dir):
+        os.makedirs(result_dir)
+    result_filename = f"{matrix_name}_eval_result_{int(time.time())}.json"
+    result_path = os.path.join(result_dir, result_filename)
 
     with open(result_path, 'w') as f:
         json.dump(eval_result, f, indent=2)
@@ -232,8 +239,9 @@ def main():
     # 处理matrix_size参数
     matrix_size = args.matrix_size
 
-    # 如果指定了matrix_name，忽略matrix_size（因为真实矩阵的大小由矩阵文件决定）
-    if matrix_name is not None and matrix_size is not None:
+    # 如果指定了真实的矩阵名称，忽略matrix_size（因为真实矩阵的大小由矩阵文件决定）
+    # 但如果matrix_name是字符串"None"，则使用matrix_size生成随机矩阵
+    if matrix_name is not None and matrix_name != "None" and matrix_size is not None:
         print("⚠️  警告: 指定了matrix_name时，matrix_size将被忽略（矩阵大小由矩阵文件决定）")
         matrix_size = None
 

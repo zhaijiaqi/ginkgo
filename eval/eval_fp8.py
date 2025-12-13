@@ -155,7 +155,7 @@ def run_fp8_evaluation(matrix_name: Optional[str] = None,
         env_dp.b_norm = np.linalg.norm(env_dp.b)
         # 重新计算初始残差
         env_dp.x = np.zeros(env_dp.matrix_size)
-        env_dp.r = env_dp._compute_exact_residual(env_dp.x, env_dp.A_diagonal, env_dp.b)
+        env_dp.r = env_dp._compute_exact_residual(env_dp.x, env_dp.A_matrix, env_dp.b)
         env_dp.p = env_dp.r.copy()
         # 重新记录初始残差
         initial_residual_norm = env_dp.math_sim.vector_norm(env_dp.r)
