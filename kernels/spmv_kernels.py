@@ -1,7 +1,11 @@
+from optparse import make_option
+from tkinter.constants import W
+
 import numpy as np
 import tilelang
 import tilelang.language as T
 import torch
+from kernel_utils import benchmark_kernel
 from scipy.sparse import coo_matrix
 
 
@@ -359,7 +363,91 @@ def make_bsr_spmv_mixed_kernel(n_block_rows, nnzb, R, C, N):
     return main
 
 
-def bsr_spmv_mixed(data_bsr, actions, indices_bsr, indptr_bsr, x, R, C, device="cuda"):
+@tilelang.jit(target="cuda")
+def make_bsr_spmv_mixed_kernel_warp_reduce(
+    n_block_rows, nnzb, R, C, N, WARPS_PER_BLOCK=2
+):
+    """
+    Build a y = A x mixed SpMV kernel for BSR format.
+
+    BSR representation:
+      data   : (nnzb, R, C) float32
+      actions: (N / C,) int32          # Precision each block-column
+      indices: (nnzb,) int32           # block-column indices
+      indptr : (n_block_rows+1,) int32 # row pointer on block-rows
+
+    Vector shapes:
+      x : (N,) float32                 # N = n_block_cols * C
+      y : (n_block_rows * R,) float32
+    """
+
+    def q(v, action):
+        v_f32 = T.Cast("float64", T.Cast("float32", v))
+        v_f16 = T.Cast("float64", T.Cast("float16", v))
+        v_bf16 = T.Cast("float64", T.Cast("bfloat16", v))
+        return T.if_then_else(
+            action == 0,
+            v,
+            T.if_then_else(
+                action == 1,
+                v_f32,
+                T.if_then_else(action == 2, v_f16, v_bf16),
+            ),
+        )
+
+    @T.prim_func
+    def main(
+        data: T.Tensor((nnzb, R, C), "float64"),
+        actions: T.Tensor(((N + C - 1) // C,), "int32"),
+        indices: T.Tensor((nnzb,), "int32"),
+        indptr: T.Tensor((n_block_rows + 1,), "int32"),
+        x: T.Tensor((N,), "float64"),
+        y: T.Tensor((n_block_rows * R,), "float64"),
+    ):
+        with T.Kernel(
+            T.ceildiv(n_block_rows, WARPS_PER_BLOCK), threads=32 * WARPS_PER_BLOCK
+        ) as bx:
+            warp = T.get_warp_idx_sync()
+            lane = T.get_lane_idx()
+            br = bx * WARPS_PER_BLOCK + warp
+            acc = T.alloc_local((1,), "float64")
+            acc[0] = T.float64(0)
+            x_lane = T.alloc_local((1,), "float64")
+            x_lane[0] = T.float64(0)
+
+            if br < n_block_rows:
+                rr = lane
+                if rr < R:
+                    start = indptr[br]
+                    end = indptr[br + 1]
+
+                    mask = T.tvm_warp_activemask()
+
+                    for bk in T.serial(start, end):
+                        bc = indices[bk]
+                        action = actions[bc]
+                        x_base = bc * C
+
+                        if lane < C:
+                            col = x_base + lane
+                            if col < N:
+                                x_lane[0] = q(x[col], action)
+
+                        for cc in T.unroll(C):
+                            vx = T.tvm_warp_shuffle(
+                                mask, x_lane[0], T.int32(cc), 32, 32
+                            )
+                            vA = q(data[bk, rr, cc], action)
+                            acc[0] += vA * vx
+
+                    y[br * R + rr] = acc[0]
+
+    return main
+
+
+def bsr_spmv_mixed(
+    data_bsr, actions, indices_bsr, indptr_bsr, x, R, C, device="cuda", kernel_list=1
+):
     """
     data_bsr   : (nnzb, R, C) float32 (numpy)
     indices_bsr: (nnzb,) int32 (numpy)
@@ -388,7 +476,11 @@ def bsr_spmv_mixed(data_bsr, actions, indices_bsr, indptr_bsr, x, R, C, device="
     y_t = torch.zeros((M,), dtype=torch.float64, device=dev)
 
     # Build kernel specialized to these sizes
-    spmv_kernel = make_bsr_spmv_mixed_kernel(n_block_rows, nnzb, R, C, N)
+    spmv_kernel = (
+        make_bsr_spmv_mixed_kernel(n_block_rows, nnzb, R, C, N)
+        if kernel_list == 0
+        else make_bsr_spmv_mixed_kernel_warp_reduce(n_block_rows, nnzb, R, C, N)
+    )
 
     # Run kernel
     spmv_kernel(data_t, actions_t, indices_t, indptr_t, x_t, y_t)
@@ -400,9 +492,9 @@ def bsr_spmv_mixed(data_bsr, actions, indices_bsr, indptr_bsr, x, R, C, device="
 
 def test_bsr_spmv():
     print("Running BSR spmv TileLang test...")
-    M, N = 100, 100
-    R, C = 4, 4  # BSR tile shape
-    density = 0.15
+    M, N = 4, 4
+    R, C = 2, 2  # BSR tile shape
+    density = 1.00
 
     rng = np.random.default_rng(0)
     size = M * N
@@ -457,10 +549,18 @@ def test_bsr_spmv_mixed():
 
     y_ref = A_bsr @ x
 
-    # actions = np.full((N // C,), 3)
-    actions = np.random.randint(0, 2, size=N // C)
+    actions = np.full((N // C,), 2)
+    # actions = np.random.randint(0, 2, size=N // C)
     y_tl = bsr_spmv_mixed(
-        ref_data, actions, ref_indices, ref_indptr, x, R, C, device="cuda"
+        ref_data,
+        actions,
+        ref_indices,
+        ref_indptr,
+        x,
+        R,
+        C,
+        device="cuda",
+        kernel_list=1,
     )
 
     print(y_tl)
@@ -469,6 +569,64 @@ def test_bsr_spmv_mixed():
     print("BSR SpMV kernel matches SciPy.")
 
 
+def bench_bsr_spmv_mixed():
+    print("Running BSR mixed spmv TileLang benchmark...")
+    M, N = 1024, 1024
+    R, C = 32, 32  # BSR tile shape
+    density = 0.15
+
+    rng = np.random.default_rng(0)
+    size = M * N
+    nnz = int(size * density)
+
+    rows = rng.integers(0, M, size=nnz, dtype=np.int32)
+    cols = rng.integers(0, N, size=nnz, dtype=np.int32)
+    vals = rng.random(nnz, dtype=np.float64)
+
+    A_coo = coo_matrix((vals, (rows, cols)), shape=(M, N))
+
+    A_bsr = A_coo.tobsr(blocksize=(R, C))
+    A_bsr.sort_indices()
+    ref_data = A_bsr.data
+    ref_indices = A_bsr.indices
+    ref_indptr = A_bsr.indptr
+
+    x = np.random.randn(N).astype(np.float64)
+    actions = np.full((N // C,), 0, dtype=np.int32)
+    n_block_rows = ref_indptr.shape[0] - 1
+    nnzb = ref_data.shape[0]
+
+    # Move to device (torch tensors)
+    dev = "cuda"
+    data_t = torch.from_numpy(ref_data).to(dev)
+    actions_t = torch.from_numpy(actions).to(dev)
+    indices_t = torch.from_numpy(ref_indices).to(dev)
+    indptr_t = torch.from_numpy(ref_indptr).to(dev)
+    x_t = torch.from_numpy(x).to(dev)
+    y_t = torch.zeros((M,), dtype=torch.float64, device=dev)
+
+    # spmv_kernel = make_bsr_spmv_mixed_kernel(n_block_rows, nnzb, R, C, N)
+    spmv_kernel_warp_reduce = make_bsr_spmv_mixed_kernel_warp_reduce(
+        n_block_rows, nnzb, R, C, N
+    )
+
+    # benchmark_kernel(
+    #     spmv_kernel,
+    #     (data_t, actions_t, indices_t, indptr_t, x_t, y_t),
+    #     nnz,
+    #     warmup=10,
+    #     iters=100,
+    # )
+    benchmark_kernel(
+        spmv_kernel_warp_reduce,
+        (data_t, actions_t, indices_t, indptr_t, x_t, y_t),
+        nnz,
+        warmup=10,
+        iters=100,
+    )
+
+
 if __name__ == "__main__":
     # test_bsr_spmv()
-    test_bsr_spmv_mixed()
+    # test_bsr_spmv_mixed()
+    bench_bsr_spmv_mixed()
