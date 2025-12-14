@@ -384,14 +384,14 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
     def q(v, action):
         v_f32 = T.Cast("float64", T.Cast("float32", v))
         v_f16 = T.Cast("float64", T.Cast("float16", v))
-        v_bf16 = T.Cast("float64", T.Cast("bfloat16", v))
+        v_fp8 = T.Cast("float64", T.Cast("float8_e4m3", v))
         return T.if_then_else(
             action == 0,
             v,
             T.if_then_else(
                 action == 1,
                 v_f32,
-                T.if_then_else(action == 2, v_f16, v_bf16),
+                T.if_then_else(action == 2, v_f16, v_fp8),
             ),
         )
 
