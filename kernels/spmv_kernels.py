@@ -395,6 +395,9 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
             ),
         )
 
+    R_TILES = (R + 31) // 32
+    C_TILES = (C + 31) // 32
+
     @T.prim_func
     def main(
         data: T.Tensor((nnzb, R, C), "float64"),
@@ -410,37 +413,49 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
             warp = T.get_warp_idx_sync()
             lane = T.get_lane_idx()
             br = bx * WARPS_PER_BLOCK + warp
-            acc = T.alloc_local((1,), "float64")
-            acc[0] = T.float64(0)
+            acc = T.alloc_local((R_TILES,), "float64")
+            for rt in T.unroll(R_TILES):
+                acc[rt] = T.float64(0)
             x_lane = T.alloc_local((1,), "float64")
             x_lane[0] = T.float64(0)
 
+            mask = T.tvm_warp_activemask()
+
             if br < n_block_rows:
-                rr = lane
-                if rr < R:
-                    start = indptr[br]
-                    end = indptr[br + 1]
+                start = indptr[br]
+                end = indptr[br + 1]
 
-                    mask = T.tvm_warp_activemask()
+                for bk in T.serial(start, end):
+                    bc = indices[bk]
+                    action = actions[bc]
+                    x_base = bc * C
 
-                    for bk in T.serial(start, end):
-                        bc = indices[bk]
-                        action = actions[bc]
-                        x_base = bc * C
+                    for ct in T.unroll(C_TILES):
+                        cc_base = ct * 32
 
-                        if lane < C:
-                            col = x_base + lane
-                            if col < N:
-                                x_lane[0] = q(x[col], action)
+                        x_lane[0] = T.float64(0)
+                        col = x_base + cc_base + lane
+                        if (cc_base + lane) < C and col < N:
+                            x_lane[0] = q(x[col], action)
 
-                        for cc in T.unroll(C):
-                            vx = T.tvm_warp_shuffle(
-                                mask, x_lane[0], T.int32(cc), 32, 32
-                            )
-                            vA = q(data[bk, rr, cc], action)
-                            acc[0] += vA * vx
+                        for cc in T.unroll(32):
+                            cc_g = cc_base + cc
+                            if cc_g < C:
+                                vx = T.tvm_warp_shuffle(
+                                    mask, x_lane[0], T.int32(cc), 32, 32
+                                )
 
-                    y[br * R + rr] = acc[0]
+                                for rt in T.unroll(R_TILES):
+                                    rr = rt * 32 + lane
+                                    if rr < R:
+                                        vA = q(data[bk, rr, cc_g], action)
+                                        acc[rt] += vA * vx
+
+                row_base = br * R
+                for rt in T.unroll(R_TILES):
+                    rr = rt * 32 + lane
+                    if rr < R:
+                        y[row_base + rr] = acc[rt]
 
     return main
 
@@ -512,7 +527,7 @@ def test_bsr_spmv():
     ref_indices = A_bsr.indices
     ref_indptr = A_bsr.indptr
 
-    x = np.random.randn(N).astype(np.float64)
+    x = rng.standard_normal(N).astype(np.float64)
 
     y_ref = A_bsr @ x
     y_tl = bsr_spmv(ref_data, ref_indices, ref_indptr, x, R, C, device="cuda")
@@ -525,8 +540,8 @@ def test_bsr_spmv():
 
 def test_bsr_spmv_mixed():
     print("Running BSR mixed spmv TileLang test...")
-    M, N = 100, 100
-    R, C = 4, 4  # BSR tile shape
+    M, N = 1024, 1024
+    R, C = 64, 64  # BSR tile shape
     density = 0.15
 
     rng = np.random.default_rng(0)
@@ -545,7 +560,7 @@ def test_bsr_spmv_mixed():
     ref_indices = A_bsr.indices
     ref_indptr = A_bsr.indptr
 
-    x = np.random.randn(N).astype(np.float64)
+    x = rng.standard_normal(N).astype(np.float64)
 
     y_ref = A_bsr @ x
 
@@ -563,8 +578,8 @@ def test_bsr_spmv_mixed():
         kernel_list=1,
     )
 
-    print(y_tl)
-    print(y_ref)
+    print(y_tl[:20])
+    print(y_ref[:20])
     assert np.allclose(y_tl, y_ref, rtol=1e-5, atol=1e-6)
     print("BSR SpMV kernel matches SciPy.")
 
