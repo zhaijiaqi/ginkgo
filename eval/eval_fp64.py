@@ -159,7 +159,7 @@ def run_fp64_evaluation(matrix_name: Optional[str] = None,
     result_dir = './log/fp64/'
     if not os.path.exists(result_dir):
         os.makedirs(result_dir)
-    result_filename = f"{matrix_name}_eval_result_{int(time.time())}.json"
+    result_filename = f"{matrix_name}_fp64_evaluation_result_{int(time.time())}.json"
     result_path = os.path.join(result_dir, result_filename)
 
     with open(result_path, 'w') as f:

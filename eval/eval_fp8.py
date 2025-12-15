@@ -275,7 +275,7 @@ def run_fp8_evaluation(matrix_name: Optional[str] = None,
     result_dir = './log/fp8/'
     if not os.path.exists(result_dir):
         os.makedirs(result_dir)
-    result_filename = f"fp8_evaluation_result_{int(time.time())}.json"
+    result_filename = f"{matrix_name}_fp8_evaluation_result_{int(time.time())}.json"
     result_path = os.path.join(result_dir, result_filename)
 
     with open(result_path, 'w') as f:

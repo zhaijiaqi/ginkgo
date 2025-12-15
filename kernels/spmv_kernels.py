@@ -42,7 +42,7 @@ def bsr_spmv_a100_native(
             "int32",
         ),  # type: ignore
         x: T.Tensor((N,), x_dtype),  # type: ignore
-        y: T.Tensor((M,), accum_dtype),
+        y: T.Tensor((M,), accum_dtype), # type: ignore
     ):
         # One block-row per CTA, B threads (one warp)
         with T.Kernel(MB, threads=B) as br:
@@ -181,11 +181,11 @@ def make_bsr_spmv_kernel(n_block_rows, nnzb, R, C, N):
 
     @T.prim_func
     def main(
-        data: T.Tensor((nnzb, R, C), "float32"),
-        indices: T.Tensor((nnzb,), "int32"),
-        indptr: T.Tensor((n_block_rows + 1,), "int32"),
-        x: T.Tensor((N,), "float32"),
-        y: T.Tensor((n_block_rows * R,), "float64"),
+        data: T.Tensor((nnzb, R, C), "float32"), # type: ignore
+        indices: T.Tensor((nnzb,), "int32"), # type: ignore
+        indptr: T.Tensor((n_block_rows + 1,), "int32"), # type: ignore
+        x: T.Tensor((N,), "float32"), # type: ignore
+        y: T.Tensor((n_block_rows * R,), "float64"), # type: ignore
     ):
         with T.Kernel(n_block_rows, threads=1) as (br,):
             y_local = T.alloc_local((R,), "float64")
@@ -308,12 +308,12 @@ def make_bsr_spmv_mixed_kernel(n_block_rows, nnzb, R, C, N):
 
     @T.prim_func
     def main(
-        data: T.Tensor((nnzb, R, C), "float64"),
-        actions: T.Tensor(((N + C - 1) // C,), "int32"),
-        indices: T.Tensor((nnzb,), "int32"),
-        indptr: T.Tensor((n_block_rows + 1,), "int32"),
-        x: T.Tensor((N,), "float64"),
-        y: T.Tensor((n_block_rows * R,), "float64"),
+        data: T.Tensor((nnzb, R, C), "float64"), # type: ignore
+        actions: T.Tensor(((N + C - 1) // C,), "int32"), # type: ignore
+        indices: T.Tensor((nnzb,), "int32"), # type: ignore
+        indptr: T.Tensor((n_block_rows + 1,), "int32"), # type: ignore
+        x: T.Tensor((N,), "float64"), # type: ignore
+        y: T.Tensor((n_block_rows * R,), "float64"), # type: ignore
     ):
         with T.Kernel(n_block_rows, threads=1) as (br,):
             y_local = T.alloc_local((R,), "float64")
@@ -400,12 +400,12 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
 
     @T.prim_func
     def main(
-        data: T.Tensor((nnzb, R, C), "float64"),
-        actions: T.Tensor(((N + C - 1) // C,), "int32"),
-        indices: T.Tensor((nnzb,), "int32"),
-        indptr: T.Tensor((n_block_rows + 1,), "int32"),
-        x: T.Tensor((N,), "float64"),
-        y: T.Tensor((n_block_rows * R,), "float64"),
+        data: T.Tensor((nnzb, R, C), "float64"), # type: ignore
+        actions: T.Tensor(((N + C - 1) // C,), "int32"), # type: ignore
+        indices: T.Tensor((nnzb,), "int32"), # type: ignore
+        indptr: T.Tensor((n_block_rows + 1,), "int32"), # type: ignore
+        x: T.Tensor((N,), "float64"), # type: ignore
+        y: T.Tensor((n_block_rows * R,), "float64"), # type: ignore
     ):
         with T.Kernel(
             T.ceildiv(n_block_rows, WARPS_PER_BLOCK), threads=32 * WARPS_PER_BLOCK
