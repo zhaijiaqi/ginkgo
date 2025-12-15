@@ -5,8 +5,9 @@ import numpy as np
 import tilelang
 import tilelang.language as T
 import torch
-from .kernel_utils import benchmark_kernel
+from kernel_utils import benchmark_kernel
 from scipy.sparse import coo_matrix
+import sys
 
 
 @tilelang.jit(target="cuda")
@@ -368,17 +369,27 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
     n_block_rows, nnzb, R, C, N, WARPS_PER_BLOCK=2
 ):
     """
-    Build a y = A x mixed SpMV kernel for BSR format.
+    Build a y = A x quantized SpMV kernel for BSR format with true quantization.
 
     BSR representation:
-      data   : (nnzb, R, C) float32
-      actions: (N / C,) int32          # Precision each block-column
+      data   : (nnzb, R, C) float64
+      actions: (N / C,) int32          # Precision level each block-column (0=float64, 1=float32, 2=float16, 3=float8)
       indices: (nnzb,) int32           # block-column indices
       indptr : (n_block_rows+1,) int32 # row pointer on block-rows
 
     Vector shapes:
-      x : (N,) float32                 # N = n_block_cols * C
-      y : (n_block_rows * R,) float32
+      x : (N,) float64                 # N = n_block_cols * C
+      y : (n_block_rows * R,) float64
+
+    True Quantization:
+      - Each tile (R x C) is quantized to the precision specified by actions
+      - Dynamic range analysis: find max(|x|) and max(|A|) for each tile
+      - Scaling: scale = max_representable_value / max_abs
+      - Quantization: scale -> clip -> convert to target precision -> dequantize (divide by scale)
+      - action == 0: float64 (no quantization)
+      - action == 1: float32 precision with quantization
+      - action == 2: float16 precision with quantization
+      - action == 3: float8_e4m3 precision with quantization
     """
 
     def q(v, action):
@@ -394,6 +405,47 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                 T.if_then_else(action == 2, v_f16, v_fp8),
             ),
         )
+
+
+    # Max representable values for different precisions
+    def get_max_value(action):
+        # Return max representable value for different precisions
+        return T.if_then_else(
+            action == 0,  # float64 - use a large value
+            T.float64(1e37),
+            T.if_then_else(
+                action == 1,  # float32
+                T.float64(3.4e38),
+                T.if_then_else(
+                    action == 2,  # float16
+                    T.float64(65504.0),  # FP16 max
+                    T.float64(448.0),    # FP8 E4M3 max
+                ),
+            ),
+        )
+
+    # True quantization with scaling and clipping for low precision formats
+    def quantize_value(value, scale, max_val, action):
+        return T.if_then_else(
+            action <= 1,  # float64 and float32: simple type conversion
+            T.if_then_else(
+                action == 0,
+                value,  # float64 - no change
+                T.Cast("float64", T.Cast("float32", value)),  # float32
+            ),
+            # action >= 2: true quantization for FP16 and FP8
+            T.if_then_else(
+                action == 2,
+                dequantize_value(T.Cast("float64", T.Cast("float16",
+                    T.max(T.min(scale * value, max_val), -max_val))), scale),  # FP16 with scaling
+                dequantize_value(T.Cast("float64", T.Cast("float8_e4m3",
+                    T.max(T.min(scale * value, max_val), -max_val))), scale),  # FP8 with scaling
+            ),
+        )
+
+    # Dequantization: convert back by dividing by scale
+    def dequantize_value(q_value, scale):
+        return q_value / scale
 
     R_TILES = (R + 31) // 32
     C_TILES = (C + 31) // 32
@@ -419,6 +471,7 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
             x_lane = T.alloc_local((1,), "float64")
             x_lane[0] = T.float64(0)
 
+
             mask = T.tvm_warp_activemask()
 
             if br < n_block_rows:
@@ -430,13 +483,45 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                     action = actions[bc]
                     x_base = bc * C
 
+                    # Calculate quantization parameters for this tile (only for low precision)
+                    max_val = get_max_value(action)
+                    x_scale = T.float64(1.0)
+                    a_scale = T.float64(1.0)
+
+                    # Only compute scaling for low precision formats (FP16, FP8)
+                    if action >= 2:
+                        # Find dynamic range of x tile
+                        x_max_abs = T.float64(0.0)
+                        for ct_check in T.unroll(C_TILES):
+                            cc_base_check = ct_check * 32
+                            for cc_check in T.unroll(32):
+                                cc_g_check = cc_base_check + cc_check
+                                if cc_g_check < C:
+                                    col_check = x_base + cc_g_check
+                                    if col_check < N:
+                                        x_val_check = x[col_check]
+                                        x_max_abs = T.max(x_max_abs, T.abs(x_val_check))
+
+                        # Find dynamic range of A tile
+                        a_max_abs = T.float64(0.0)
+                        for rr_check in T.serial(R):
+                            for cc_check in T.serial(C):
+                                a_val_check = data[bk, rr_check, cc_check]
+                                a_max_abs = T.max(a_max_abs, T.abs(a_val_check))
+
+                        # Calculate scaling factors: scale = max_representable / max_abs
+                        x_scale = max_val / (x_max_abs + T.float64(1e-12))
+                        a_scale = max_val / (a_max_abs + T.float64(1e-12))
+
                     for ct in T.unroll(C_TILES):
                         cc_base = ct * 32
 
                         x_lane[0] = T.float64(0)
                         col = x_base + cc_base + lane
                         if (cc_base + lane) < C and col < N:
-                            x_lane[0] = q(x[col], action)
+                            # Apply quantization to x
+                            x_val = x[col]
+                            x_lane[0] = quantize_value(x_val, x_scale, max_val, action)
 
                         for cc in T.unroll(32):
                             cc_g = cc_base + cc
@@ -448,7 +533,9 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                                 for rt in T.unroll(R_TILES):
                                     rr = rt * 32 + lane
                                     if rr < R:
-                                        vA = q(data[bk, rr, cc_g], action)
+                                        # Apply quantization to A
+                                        a_val = data[bk, rr, cc_g]
+                                        vA = quantize_value(a_val, a_scale, max_val, action)
                                         acc[rt] += vA * vx
 
                 row_base = br * R
@@ -564,7 +651,7 @@ def test_bsr_spmv_mixed():
 
     y_ref = A_bsr @ x
 
-    actions = np.full((N // C,), 2)
+    actions = np.full((N // C,), 3)
     # actions = np.random.randint(0, 2, size=N // C)
     y_tl = bsr_spmv_mixed(
         ref_data,
@@ -607,7 +694,7 @@ def bench_bsr_spmv_mixed():
     ref_indptr = A_bsr.indptr
 
     x = np.random.randn(N).astype(np.float64)
-    actions = np.full((N // C,), 0, dtype=np.int32)
+    actions = np.full((N // C,), 3, dtype=np.int32)
     n_block_rows = ref_indptr.shape[0] - 1
     nnzb = ref_data.shape[0]
 
@@ -639,9 +726,9 @@ def bench_bsr_spmv_mixed():
         warmup=10,
         iters=100,
     )
-
-
+    
+    
 if __name__ == "__main__":
     # test_bsr_spmv()
-    # test_bsr_spmv_mixed()
-    bench_bsr_spmv_mixed()
+    test_bsr_spmv_mixed()
+    # bench_bsr_spmv_mixed()
