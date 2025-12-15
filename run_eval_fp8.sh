@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# Script to run eval_fp8.py for each matrix name in valid_matrix_set.csv
+# Script to run eval_fp8.py for each matrix name in cg_results.csv
 # Record all completed matrices (converged or reached max iterations) with progress updates every 10 matrices
 
 # Check if the CSV file exists
-if [ ! -f "valid_matrix_set.csv" ]; then
-    echo "Error: valid_matrix_set.csv not found!"
+if [ ! -f "cg_results.csv" ]; then
+    echo "Error: cg_results.csv not found!"
     exit 1
 fi
 
@@ -64,7 +64,7 @@ run_evaluation() {
 }
 
 # Skip the header line and extract the Name column (3rd column)
-tail -n +2 valid_matrix_set.csv | awk -F',' '{print $3}' | while read -r matrix_name; do
+tail -n +2 cg_results.csv | awk -F',' '{print $3}' | while read -r matrix_name; do
     # Skip empty lines
     if [ -n "$matrix_name" ]; then
         run_evaluation "$matrix_name"

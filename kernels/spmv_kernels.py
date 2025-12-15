@@ -5,7 +5,7 @@ import numpy as np
 import tilelang
 import tilelang.language as T
 import torch
-from kernel_utils import benchmark_kernel
+from .kernel_utils import benchmark_kernel
 from scipy.sparse import coo_matrix
 
 

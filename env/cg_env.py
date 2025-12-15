@@ -95,7 +95,6 @@ class CGEnvironment:
         # 矩阵数据缓存
         self.A_matrix = None  # scipy csr_matrix
         self.A_sparse = None  # 我们的 SparseMatrix 格式
-        self.A_diagonal = None  # 对角线元素（用于兼容现有代码）
         self.matrix_loaded = False  # 标记矩阵是否已加载
 
         # 预分组的tile数据（性能优化）
@@ -202,7 +201,7 @@ class CGEnvironment:
 
         return A
 
-    def _generate_problem(self) -> Tuple[List[float], np.ndarray]:
+    def _generate_problem(self) -> Tuple:
         """
         生成 CG 测试问题 Ax = b
 
@@ -210,11 +209,11 @@ class CGEnvironment:
         否则生成一个简单的对角占优矩阵来确保收敛。
 
         Returns:
-            (A_diagonal, b) - 对角线元素和右端项
+            (A_matrix, b) - 稀疏矩阵和右端项
         """
         if self.matrix_loaded:
             # 矩阵已加载，直接返回缓存的数据
-            return self.A_diagonal, self.b
+            return self.A_matrix, self.b
 
         if self.matrix_name is not None:
             # 加载真实的矩阵
@@ -223,11 +222,8 @@ class CGEnvironment:
                 self.matrix_size = self.A_matrix.shape[0]
                 self.matrix_nnz = self.A_matrix.nnz
 
-                # 提取对角线元素用于兼容现有代码
-                A_diagonal = self.A_matrix.diagonal().tolist()
-
-                # 生成右端项 b
-                b = np.array([random.gauss(0, 1) for _ in range(self.matrix_size)])
+                # 生成右端项 b（A 的列值相加）
+                b = np.array(self.A_matrix.sum(axis=0)).flatten()
 
                 print(f"Loaded matrix '{self.matrix_name}' with size {self.matrix_size}x{self.matrix_size}, nnz {self.matrix_nnz}")
 
@@ -241,18 +237,17 @@ class CGEnvironment:
                 self.bsr_data, self.bsr_indices, self.bsr_indptr, self.bsr_R, self.bsr_C = self._convert_matrix_to_bsr()
 
                 self.matrix_loaded = True
+                self.b = b  # 将 b 缓存为属性，便于下次复用
 
             except Exception as e:
                 print(f"Failed to load matrix '{self.matrix_name}': {e}")
                 print("Falling back to random matrix generation")
                 self.matrix_name = None
-                A_diagonal, b = self._generate_random_problem()
-                self.matrix_loaded = True
-                return A_diagonal, b
+                return self._generate_random_problem()
         else:
             return self._generate_random_problem()
 
-        return A_diagonal, b
+        return self.A_matrix, self.b
 
     def _generate_random_problem(self) -> Tuple[List[float], np.ndarray]:
         """
@@ -268,8 +263,9 @@ class CGEnvironment:
             diagonal = 2.0 + 0.5 * random.random() + i * 0.01
             A_diagonal.append(diagonal)
 
-        # 生成右端项 b
-        b = np.array([random.gauss(0, 1) for _ in range(self.matrix_size)])
+        # 生成右端项 b，b 初始化为：每个A对应列元素之和（对于对角矩阵就是对角线元素的拷贝）
+        b = np.array(self.A_matrix.sum(axis=0)).flatten()
+        print(f"L2 norm of b: {self.math_sim.vector_norm(b)}")
 
         # 为随机矩阵创建稀疏矩阵表示（对角矩阵）
         self.A_sparse = SparseMatrix(self.matrix_size, self.matrix_size, self.matrix_size)
@@ -398,26 +394,21 @@ class CGEnvironment:
 
         return block
 
-    def _compute_exact_residual(self, x: np.ndarray, A_diagonal: List[float], b: np.ndarray) -> np.ndarray:
+    def _compute_exact_residual(self, x: np.ndarray, A_matrix: csr_matrix, b: np.ndarray) -> np.ndarray:
         """
         计算精确残差 r = b - A*x
 
         Args:
             x: 当前解向量
-            A_diagonal: 矩阵对角线（仅在随机矩阵时使用）
+            A_matrix: 矩阵
             b: 右端项
 
         Returns:
             残差向量 (numpy数组)
         """
-        if self.A_matrix is not None:
-            # 使用真实的稀疏矩阵计算 A*x
-            Ax_np = self.A_matrix.dot(x)
-            Ax = Ax_np
-        else:
-            # 使用对角线近似计算 A*x（兼容随机矩阵）
-            Ax = np.array(A_diagonal) * x
 
+        Ax_np = A_matrix.dot(x)
+        Ax = Ax_np
         # 计算 r = b - A*x
         r = self.math_sim.vector_sub(b, Ax)
         return r
@@ -535,12 +526,13 @@ class CGEnvironment:
             state.extend(tile_state)
         return state
 
-    def reset(self, seed: Optional[int] = None) -> List[float]:
+    def reset(self, seed: Optional[int] = None, initial_x: Optional[np.ndarray] = None) -> List[float]:
         """
         重置环境，开始新的 CG 求解 episode
 
         Args:
             seed: 随机种子
+            initial_x: 自定义初始解向量，如果为None则使用默认值
 
         Returns:
             初始状态特征向量
@@ -560,14 +552,16 @@ class CGEnvironment:
         self.episode_done = False
 
         # 生成新的问题（可能更新matrix_size）
-        A_diagonal, self.b = self._generate_problem()
-        self.A_diagonal = A_diagonal  # 缓存对角线元素
+        self.A_matrix, self.b = self._generate_problem()
         
         self.b_norm = self.math_sim.vector_norm(self.b)
 
         # CG 初始化（确保使用更新后的matrix_size）
-        self.x = np.ones(self.matrix_size)  # x0 = 1
-        self.r = self._compute_exact_residual(self.x, A_diagonal, self.b)  # r0 = b - A*x0
+        if initial_x is not None:
+            self.x = initial_x.copy()
+        else:
+            self.x = np.zeros(self.matrix_size)  # x0 = 1
+        self.r = self._compute_exact_residual(self.x, self.A_matrix, self.b)  # r0 = b - A*x0
         self.p = self.r.copy()  # p0 = r0
 
         # 记录初始残差
@@ -641,17 +635,19 @@ class CGEnvironment:
         # 使用 TileLang kernel 执行 SpMV 计算
         # time_start = time.time()
         
-        # 真实 kernel 版本
+        # # 真实 kernel 版本
+        # print("self.p[:10]:", ["{:.2e}".format(v) for v in self.p[:10]])
         self.Ap = bsr_spmv_mixed(
             self.bsr_data, actions_np, self.bsr_indices, self.bsr_indptr,
             self.p, self.bsr_R, self.bsr_C, device="cuda"
         )
-
         # 裁剪 self.Ap 到实际矩阵大小，去掉 padding 的计算结果
         if len(self.Ap) > self.matrix_size:
             self.Ap = self.Ap[:self.matrix_size]
             
-        # 仿真版本
+        print("bsr_spmv_mixed---self.Ap[:10]:", ["{:.2e}".format(v) for v in self.Ap[:10]])
+            
+        # # 仿真版本
         # for tile_idx in range(num_tiles):
         #     start_idx = tile_idx * tilesize
         #     actual_tilesize = min(tilesize, self.matrix_size - start_idx)
@@ -663,6 +659,8 @@ class CGEnvironment:
         #     partial_result, cpt_cost = self.spmv_sim.simulate_spmv_block(matrix_block, self.p, action)
         #     # 累加到 Ap 向量（使用numpy切片操作）
         #     self.Ap[start_idx:end_idx] += partial_result[:actual_tilesize]
+            
+        # print("simulate_spmv_block---self.Ap[:10]:", ["{:.2e}".format(v) for v in self.Ap[:10]/2])
         
         # time_end = time.time()
         # iteration_compute_time = (time_end - time_start)*1000
@@ -719,6 +717,7 @@ class CGEnvironment:
             print("================================================")
             print(f"当前迭代次数: {self.current_iteration}")
             print(f"当前迭代残差: {residual_norm}")
+            print(f"当前相对残差：{residual_norm/self.initial_residual_norm}")
             print(f"当前迭代每tile平均计算成本: {iteration_cpt_cost/num_tiles}")
             print(f"当前迭代是否收敛: {converged}")
             print(f"残差下降奖励: {self.w1 * (-math.log(residual_norm/self.initial_residual_norm, 10))}")
@@ -803,7 +802,6 @@ class CGEnvironment:
         # if p_dot_Ap <= 1e-20:  # 使用更小的阈值来检测数值问题
         #     # Ap 与 p 不正交或数值不稳定，算法发散
         #     return -self.w3, True
-
         alpha = r_dot_r / p_dot_Ap
 
         # 添加数值稳定性检查：防止alpha过大导致的数值爆炸
@@ -824,7 +822,7 @@ class CGEnvironment:
         self.residual_tracker.record_residual(residual_norm)
 
         # 检查收敛
-        converged = residual_norm < self.stop_tol
+        converged = residual_norm/self.b_norm < self.stop_tol
 
         # 计算 beta = (r^T r) / (old_r_dot_r)
         old_r_dot_r = r_dot_r
@@ -897,4 +895,6 @@ class CGEnvironment:
             'converged': converged,  # 使用0/1而不是False/True
             'total_cost': total_cost,
             'avg_tile_cost': avg_tile_cost,
-            'residual_history': residua
+            'residual_history': residual_history,
+            'step_rewards': self.step_rewards.copy() if self.step_rewards else []
+        }
