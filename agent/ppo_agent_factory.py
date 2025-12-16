@@ -16,27 +16,6 @@ import time
 from models import create_cg_model
 
 
-class GradientClippingPPO(PPO):
-    """
-    带有梯度裁剪的 PPO 代理，用于防止梯度爆炸
-    """
-
-    def __init__(self, max_grad_norm=0.5, **kwargs):
-        super().__init__(**kwargs)
-        self.max_grad_norm = max_grad_norm
-
-    def _update(self, batch):
-        """重写更新方法，添加梯度裁剪"""
-        # 调用父类的更新逻辑
-        loss = super()._update(batch)
-
-        # 在反向传播后添加梯度裁剪
-        if self.max_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
-        return loss
-
-
 # 为了向后兼容，保留这个函数
 def create_cg_model(state_dim: int, action_size: int, hidden_sizes=(64, 64)):
     """创建CG模型的向后兼容函数"""
@@ -73,7 +52,7 @@ class CGPPOAgent:
                 agent_kwargs['max_grad_norm'] = max_grad_norm
 
             # 创建代理实例，使用带有梯度裁剪的 PPO
-            agent = GradientClippingPPO(**agent_kwargs)
+            agent = PPO(**agent_kwargs)
             self.tile_agents.append(agent)
 
     def _create_single_tile_model(self, tile_state_dim: int, action_size: int, hidden_sizes: list):
@@ -151,12 +130,6 @@ class CGPPOAgent:
         batch_obs = obs_array.reshape(self.num_tiles, self.tile_state_dim)
         batch_obs = torch.from_numpy(batch_obs)
 
-        # 检查输入数据是否有 NaN 或 inf
-        if torch.isnan(batch_obs).any() or torch.isinf(batch_obs).any():
-            print(f"警告: 输入观测包含 NaN 或 inf 值: {batch_obs}")
-            # 用 0 替换 NaN/inf 值
-            batch_obs = torch.nan_to_num(batch_obs, nan=0.0, posinf=1.0, neginf=-1.0)
-
         # 使用共享模型进行推理（所有代理共享相同模型）
         model = self.tile_agents[0].model
         device = next(model.parameters()).device
@@ -165,16 +138,8 @@ class CGPPOAgent:
         # 前向传播获取策略分布
         with torch.no_grad():
             policy_out, _ = model(batch_obs)
-
-            # 检查策略输出是否有 NaN
-            if hasattr(policy_out, 'logits'):
-                logits = policy_out.logits
-                if torch.isnan(logits).any() or torch.isinf(logits).any():
-                    print(f"警告: 策略 logits 包含 NaN 或 inf 值: {logits}")
-                    # 用小的随机值替换 NaN/inf logits
-                    logits = torch.nan_to_num(logits, nan=-1e-6, posinf=1e6, neginf=-1e6)
-                    # 重新创建分布
-                    policy_out = torch.distributions.Categorical(logits=logits)
+            logits = policy_out.logits
+            policy_out = torch.distributions.Categorical(logits=logits)
 
             # policy_out 是批量分类分布，从中采样动作
             actions = policy_out.sample().cpu().numpy()
@@ -255,7 +220,9 @@ class CGPPOAgent:
     def eval_mode(self):
         """切换到评估模式"""
         for tile_agent in self.tile_agents:
+            print(f"Before mode switch: tile_agent.training: {tile_agent.training}")
             tile_agent.eval_mode()
+            print(f"After mode switch: tile_agent.training: {tile_agent.training}")
 
     @property
     def training(self):
@@ -304,7 +271,7 @@ class PPOAgentFactory:
 
         # PPO 参数（传递给子代理）
         
-        print("self.update_interval: ", self.ppo_config.get('update_interval', 2048))
+        # print("self.update_interval: ", self.ppo_config.get('update_interval', 2048))
 
         # 创建 CG PPO 代理
         # 参数解释:
@@ -338,12 +305,12 @@ class PPOAgentFactory:
             num_tiles=num_tiles,
             tile_state_dim=tile_state_dim,
             action_size=action_size,
-            hidden_sizes=hidden_sizes,                                          # 隐藏层大小
+            hidden_sizes=hidden_sizes,                                         # 隐藏层大小
             lr=float(self.ppo_config.get('learning_rate', 1e-4)),              # 学习率
             gpu=self.ppo_config.get('gpu', 0),                                 # GPU设备编号
             gamma=self.ppo_config.get('gamma', 0.99),                          # 折扣因子
             lambd=self.ppo_config.get('lambda', 0.95),                         # GAE lambda
-            phi=lambda x: np.asarray(x, dtype=np.float32),                 # 状态预处理
+            phi=lambda x: np.asarray(x, dtype=np.float32),                     # 状态预处理
             value_func_coef=self.ppo_config.get('value_coef', 0.5),            # 值函数损失系数
             entropy_coef=self.ppo_config.get('entropy_coef', 0.01),            # 熵奖励系数
             update_interval=self.ppo_config.get('update_interval', 1),         # 参数更新间隔

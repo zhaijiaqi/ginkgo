@@ -120,14 +120,14 @@ def extract_train_config(config: Dict) -> Dict:
 
 
 class DoublePrecisionWrapperAgent:
-    """包装 PPO 代理，每10个episode强制使用一次双精度动作"""
+    """包装 PPO 代理，实现概率逐渐衰减的精度选择策略"""
 
-    def __init__(self, ppo_agent=None, num_tiles: int = None, force_interval: int = 10):
+    def __init__(self, ppo_agent=None, num_tiles: int = None, total_episodes: int = 1000):
         self.ppo_agent = ppo_agent
         self.num_tiles = num_tiles
-        self.force_interval = force_interval  # 每多少个episode强制一次双精度
+        self.total_episodes = total_episodes  # 总训练episode数
         self.episode_count = 0
-        self.is_force_dp_episode = True
+        self.is_force_dp_episode = True  # 第一个episode强制使用双精度
         self.force_episode_stats = None
         self.force_episode_started = False
 
@@ -138,13 +138,45 @@ class DoublePrecisionWrapperAgent:
         # 添加 tile_agents 属性，指向底层代理的 tile_agents
         self.tile_agents = ppo_agent.tile_agents if hasattr(ppo_agent, 'tile_agents') and ppo_agent is not None else []
 
+    def _get_force_dp_probability(self, episode_num: int) -> float:
+        """
+        计算当前episode强制使用双精度的概率
+
+        Args:
+            episode_num: 当前episode编号（从1开始）
+
+        Returns:
+            强制使用双精度的概率 (0.0 到 1.0)
+        """
+        if episode_num == 1:
+            # 第一个episode强制使用双精度
+            return 1.0
+
+        phase_1_end = int(self.total_episodes * 0.1)  # 前10%的episode
+        phase_2_end = int(self.total_episodes * 0.5)  # 前50%的episode
+
+        if episode_num <= phase_1_end:
+            # 前10%的episode: 90%概率强制使用fp64
+            return 0.5
+        elif episode_num <= phase_2_end:
+            # 从10%到50%的episode: 概率从90%线性衰减到0%
+            progress = (episode_num - phase_1_end) / (phase_2_end - phase_1_end)
+            return 0.5 * (1.0 - progress)
+        else:
+            # 50%之后的episode: 完全由agent决定
+            return 0.0
+
     def act(self, obs):
-        """在指定的episode间隔强制使用双精度动作"""
-        if self.is_force_dp_episode or self.ppo_agent is None:
-            # 强制双精度episode或纯双精度代理使用 fp64 (动作 0)
+        """根据概率策略选择是否强制使用双精度动作"""
+        if self.ppo_agent is None:
+            # 纯双精度代理总是使用 fp64 (动作 0)
+            return [0] * self.num_tiles
+
+        if self.is_force_dp_episode and self.training:
+            # 当前episode被确定为强制双精度episode
             return [0] * self.num_tiles
         else:
-            # 正常episodes使用 PPO 代理的动作
+            # 使用 PPO 代理的动作
             return self.ppo_agent.act(obs)
 
     def observe(self, obs, reward, done, reset):
@@ -163,19 +195,21 @@ class DoublePrecisionWrapperAgent:
             # 正常观察
             self.ppo_agent.observe(obs, reward, done, reset)
 
-            if done:
-                self.episode_count += 1
-                # 检查当前episode是否应该是强制双精度episode
-                if self.episode_count % self.force_interval == 0:
-                    self.is_force_dp_episode = True
-        elif done and self.is_force_dp_episode:
-            # 强制双精度episode结束，切换到正常模式
-            self.is_force_dp_episode = False
+        # 在episode结束时处理episode计数和下一episode的强制双精度决策
+        if done:
             self.episode_count += 1
 
-    def start_force_episode(self):
-        """标记强制双精度episode开始"""
-        self.force_episode_started = True
+            # 如果当前是强制双精度episode，重置标志
+            if self.is_force_dp_episode:
+                self.is_force_dp_episode = False
+
+            # 为下一个episode决定是否强制使用双精度
+            next_episode_num = self.episode_count + 1
+            force_probability = self._get_force_dp_probability(next_episode_num)
+
+            if np.random.random() < force_probability:
+                self.is_force_dp_episode = True
+
 
     def save(self, path):
         """保存 PPO 代理"""
@@ -217,9 +251,9 @@ def run_double_precision_episode_with_agent(env: CGEnvironment, agent, initial_x
     """
     print("=== 运行双精度 episode 来确定合适的 max_iter ===")
 
-    # 如果是包装器代理，标记强制双精度episode开始
-    if hasattr(agent, 'start_force_episode'):
-        agent.start_force_episode()
+    # 如果是包装器代理，确保强制双精度episode模式
+    if hasattr(agent, 'is_force_dp_episode'):
+        agent.is_force_dp_episode = True
 
     # 重置环境开始 episode
     obs = env.reset(initial_x=initial_x)
@@ -293,9 +327,12 @@ def train_cg_ppo(config: Dict):
     matrix_size = config.get('cg', {}).get('matrix_size')
     initial_x = load_initial_x0(env_config, matrix_name, matrix_size)
 
-    # 使用包装器包装 PPO 代理，每10个episode强制使用一次双精度
-    force_interval = config.get('train', {}).get('force_interval', 50)
-    wrapped_agent = DoublePrecisionWrapperAgent(cg_agent, num_tiles, force_interval=force_interval)
+    # 获取训练参数
+    train_params = extract_train_config(config)
+    total_episodes = train_params['total_episodes']
+
+    # 使用包装器包装 PPO 代理，实现概率逐渐衰减的精度选择策略
+    wrapped_agent = DoublePrecisionWrapperAgent(cg_agent, num_tiles, total_episodes=total_episodes)
 
     # 确保 PPO 代理处于训练模式
     for tile_agent in cg_agent.tile_agents:
@@ -313,10 +350,16 @@ def train_cg_ppo(config: Dict):
     original_max_iter = config['cg']['max_iter']
     new_max_iter = int(dp_result['iterations'] * 2)
     config['cg']['max_iter'] = max(new_max_iter, 10)  # 至少设置为 10
+    # 更新 eval_interval 和 save_interval
+    eval_interval_episode = config['train']['eval_interval_episode']
+    save_interval_episode = config['train']['save_interval_episode']
+    train_params['eval_interval'] = eval_interval_episode * config['cg']['max_iter']
+    train_params['save_interval'] = save_interval_episode * config['cg']['max_iter']
+    
 
     print(f"更新 max_iter: {original_max_iter} -> {config['cg']['max_iter']}")
     print(f"双精度基准计算成本: {dp_result['compute_cost']:.6f}")
-    print(f"每 {wrapped_agent.force_interval} 个episode将强制运行一次双精度episode以确保收敛")
+    print("精度选择策略: 前10%的episode 90%概率使用fp64，后续逐渐衰减到50%时完全由agent决定")
 
     # 重新创建环境（使用更新后的 max_iter）
     env_config = create_env_config(config)
@@ -332,13 +375,15 @@ def train_cg_ppo(config: Dict):
         matrix_identifier = matrix_name
     log_dir = os.path.join('log', f'{matrix_identifier}_tilesize{tilesize}_{timestamp}')
     logger = TrainingLogger(log_dir)
-
-    # 训练参数
-    train_params = extract_train_config(config)
     # 创建训练统计钩子
     training_hook = TrainingStatsHook(logger, env, train_params['eval_interval'])
     # 创建评估钩子
     eval_hook = EvalHook(training_hook)
+    
+    print("="*80)
+    print("训练参数如下：")
+    print(json.dumps(train_params, indent=2, ensure_ascii=False))
+    print("="*80)
 
     # 使用 pfrl.experiments.train_agent_with_evaluation
     try:

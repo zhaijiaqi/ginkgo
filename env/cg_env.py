@@ -61,7 +61,8 @@ class CGEnvironment:
         self.w1 = reward_config.get('w1', 1.0)   # 数值误差权重
         self.w2 = reward_config.get('w2', 0.1)   # 计算成本权重
         self.w3 = reward_config.get('w3', 10.0)  # 收敛奖励权重
-
+        self.w4 = reward_config.get('w4', 100.0)  # 发散惩罚权重
+        self.w5 = reward_config.get('w5', 0.3)  # 高精度鼓励权重
         # 环境参数
         self.normalize_state = config.get('normalize_state', True)
 
@@ -644,37 +645,6 @@ class CGEnvironment:
         # 裁剪 self.Ap 到实际矩阵大小，去掉 padding 的计算结果
         if len(self.Ap) > self.matrix_size:
             self.Ap = self.Ap[:self.matrix_size]
-            
-        print("bsr_spmv_mixed---self.Ap[:10]:", ["{:.2e}".format(v) for v in self.Ap[:10]])
-            
-        # # 仿真版本
-        # for tile_idx in range(num_tiles):
-        #     start_idx = tile_idx * tilesize
-        #     actual_tilesize = min(tilesize, self.matrix_size - start_idx)
-        #     end_idx = start_idx + actual_tilesize
-        #     # 使用预计算的tile块
-        #     matrix_block = self.tile_blocks[tile_idx]
-        #     # 模拟该 tile 的 SpMV 计算
-        #     action = actions[tile_idx]
-        #     partial_result, cpt_cost = self.spmv_sim.simulate_spmv_block(matrix_block, self.p, action)
-        #     # 累加到 Ap 向量（使用numpy切片操作）
-        #     self.Ap[start_idx:end_idx] += partial_result[:actual_tilesize]
-            
-        # print("simulate_spmv_block---self.Ap[:10]:", ["{:.2e}".format(v) for v in self.Ap[:10]/2])
-        
-        # time_end = time.time()
-        # iteration_compute_time = (time_end - time_start)*1000
-        # print(f"TileLang BSR SpMV 计算时间: {iteration_compute_time:.2f} ms")
-
-            
-            
-        # 真实计算总成本（相对于 fp64 基准时间的百分比）
-        # if self.fp64_baseline_time is not None and self.fp64_baseline_time > 0:
-        #     iteration_cpt_cost = (iteration_compute_time / self.fp64_baseline_time) * 100  # 百分比
-        #     print(f"相对于 fp64 基准时间的计算成本: {iteration_cpt_cost:.1f}%")
-        # else:
-        #     iteration_cpt_cost = iteration_compute_time  # 如果基准时间不可用，使用绝对时间
-        # 累加到 episode 总成本
 
         # 计算每个 tile 的计算成本，并累加得到迭代总成本
         iteration_cpt_cost = 0.0
@@ -691,39 +661,47 @@ class CGEnvironment:
 
         # 完成一次 CG 迭代
         cg_math_start_time = time.time()
-        converged, residual_norm, iter_done = self._complete_cg_iteration()
+        residual_norm, prev_residual_norm, converged, done, diverged = self._complete_cg_iteration()
         cg_math_end_time = time.time()
         self.performance_stats['cg_math_time'] += (cg_math_end_time - cg_math_start_time)
 
-        # 计算当前迭代的奖励
-        # 如果到达最大迭代步数但仍未收敛，加惩罚
-        if self.current_iteration + 1 >= self.max_iter and not converged:
-            # 给予较大惩罚（如 -self.w3 * self.max_iter）
-            iteration_reward = (
-                self.w1 * (-math.log(residual_norm/self.initial_residual_norm, 10))
-                - self.w2 * (iteration_cpt_cost/num_tiles)
-                - self.max_iter  # 强惩罚
-            )
-            print(f"未收敛惩罚: {-self.max_iter}")
-        else:
-            iteration_reward = (
-                self.w1 * (-math.log(residual_norm/self.initial_residual_norm, 10))
-                - self.w2 * (iteration_cpt_cost/num_tiles)
-                + self.w3 * converged * (self.max_iter - self.current_iteration)/10
-            )
+        # ===== 新的 reward 计算逻辑 =====
+        # 1. 残差下降奖励 (R_progress)：step-wise log 残差下降
+        progress_reward = self.w1 * math.log(prev_residual_norm / residual_norm)
 
-        if self.current_iteration % 10 == 0 or converged:
+        # 2. 计算代价惩罚 (R_cost)：鼓励使用低精度
+        cost_penalty = -self.w2 * (iteration_cpt_cost / num_tiles)
+
+        # 3. 收敛终止奖励 (R_converge)：只在真正收敛时给予
+        convergence_reward = self.w3 * converged
+
+        # 4. 数值失败惩罚 (R_failure)：检测多种失败情况
+        failure_penalty = 0.0
+        if residual_norm > 2.0 * self.initial_residual_norm or residual_norm > prev_residual_norm * 1.2: # 持续的残差上升惩罚
+            failure_penalty = -self.w4
+        if not np.isfinite(residual_norm): # 检查 NaN/Inf
+            failure_penalty = -self.w4 * 5
+             
+        # 5. 发散惩罚
+        diverged_penalty = -self.max_iter * 10 if diverged else 0
+
+        # 计算总奖励
+        iteration_reward = progress_reward + cost_penalty + convergence_reward + failure_penalty + diverged_penalty
+
+        if self.current_iteration % 10 == 0 or done:
             print("")
             print("================================================")
             print(f"当前迭代次数: {self.current_iteration}")
             print(f"当前迭代残差: {residual_norm}")
-            print(f"当前相对残差：{residual_norm/self.initial_residual_norm}")
+            print(f"当前相对残差：{residual_norm/self.b_norm}")
             print(f"当前迭代每tile平均计算成本: {iteration_cpt_cost/num_tiles}")
             print(f"当前迭代是否收敛: {converged}")
-            print(f"残差下降奖励: {self.w1 * (-math.log(residual_norm/self.initial_residual_norm, 10))}")
-            print(f"计算成本奖励: {-self.w2 * (iteration_cpt_cost/num_tiles)}")
-            print(f"收敛奖励: {self.w3 * converged}")
-            print(f"总奖励: {iteration_reward}")
+            print(f"1.残差下降奖励 (R_progress): {progress_reward}")
+            print(f"2.计算代价惩罚 (R_cost):     {cost_penalty}")
+            print(f"3.数值失败惩罚 (R_failure):  {failure_penalty}")
+            print(f"4.发散惩罚     (R_diverged):{diverged_penalty}")
+            print(f"5.收敛终止奖励 (R_converge): {convergence_reward}")
+            print(f"总奖励:                 : {iteration_reward}")
             # 统计每种精度选择的数量
             from collections import Counter
             precisions_to_test = [
@@ -740,8 +718,7 @@ class CGEnvironment:
                 print(f"  精度 {precision_name}: {count} 个")
 
         # 检查是否结束
-        done = iter_done
-        if not iter_done:
+        if not done:
             # 开始新的迭代
             self.current_iteration += 1
             if self.current_iteration >= self.max_iter:
@@ -788,20 +765,29 @@ class CGEnvironment:
         return next_state, iteration_reward, done, info
 
 
-    def _complete_cg_iteration(self) -> Tuple[float, bool]:
+    def _complete_cg_iteration(self) -> Tuple[bool, float, bool, bool, float]:
         """
         完成一次完整的 CG 迭代
 
         Returns:
-            (iteration_reward, done) - 迭代奖励和是否结束
+            (converged, residual_norm, done, diverged, prev_residual_norm) - 收敛状态、当前残差范数、是否结束、是否发散、上一个残差范数
         """
+        # 记录上一个残差范数（用于 step-wise reward 计算）
+        prev_residual_norm = self.math_sim.vector_norm(self.r)
+
         # 计算 alpha = (r^T r) / (p^T Ap)
         r_dot_r = self.math_sim.vector_dot(self.r, self.r)
         p_dot_Ap = self.math_sim.vector_dot(self.p, self.Ap)
+        diverged = False
 
-        # if p_dot_Ap <= 1e-20:  # 使用更小的阈值来检测数值问题
-        #     # Ap 与 p 不正交或数值不稳定，算法发散
-        #     return -self.w3, True
+        if p_dot_Ap <= 1e-300:  # 使用更小的阈值来检测数值问题
+            # Ap 与 p 不正交或数值不稳定，算法发散
+            print("Ap 与 p 不正交或数值不稳定，算法发散")
+            diverged = True
+            done = True
+            converged = False
+            current_residual_norm = self.math_sim.vector_norm(self.r)
+            return  current_residual_norm, prev_residual_norm, converged, done, diverged
         alpha = r_dot_r / p_dot_Ap
 
         # 添加数值稳定性检查：防止alpha过大导致的数值爆炸
@@ -844,7 +830,7 @@ class CGEnvironment:
 
         done = converged or (self.current_iteration >= self.max_iter - 1)
 
-        return converged, residual_norm, done
+        return residual_norm, prev_residual_norm, converged, done, diverged
 
     def get_action_space_size(self) -> int:
         """获取动作空间大小"""

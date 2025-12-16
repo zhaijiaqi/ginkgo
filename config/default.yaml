@@ -16,29 +16,31 @@ spmv:
 
 reward:
   type: weighted
-  w1: 1.0  # 数值误差奖励权重
-  w2: 1.0  # 计算成本奖励权重
-  w3: 10.0 # 收敛性奖励权重
+  w1: 10  # 数值误差奖励权重
+  w2: 0.1  # 计算成本奖励权重
+  w3: 100.0 # 收敛性奖励权重
+  w4: 2.0  # 发散惩罚权重
 
 ppo:
   gamma: 0.99                # 折扣因子
-  learning_rate: 3e-4        # 学习率，降低可提高稳定性
+  learning_rate: 1e-4        # 学习率，降低可提高稳定性
   n_epochs: 10               # 每次更新时训练所有数据的轮数
-  batch_size: 64            # 每个更新周期的小批量样本数
+  batch_size: 256            # 每个更新周期的小批量样本数
   clip_range: 0.2            # PPO策略损失裁剪参数ε
-  value_coef: 0.5            # value function 损失的权重
-  entropy_coef: 0.01         # 熵奖励系数，鼓励探索
+  value_coef: 0.25            # value function 损失的权重
+  entropy_coef: 0.02         # 熵奖励系数，鼓励探索
   gpu: 0                    # GPU设备编号，-1表示自动选择可用GPU
-  update_interval: 10        # 网络参数每隔多少步更新一次
+  update_interval: 256       # 网络参数每隔多少步更新一次
   hidden_sizes: [64, 64]     # 神经网络隐藏层大小列表, 如[64,64]为两层每层64单元
   max_grad_norm: 0.5         # 梯度裁剪最大范数
 
 train:
-  total_episodes: 1000
-  eval_interval: 1000
+  total_episodes: 500
+  eval_interval_episode: 20
+  eval_interval: None
   eval_n_episodes: 5
-  save_interval: 1000
-  force_interval: 1000  # 每1000个episode强制使用一次双精度，相当于只在开头使用
+  save_interval_episode: 20
+  save_interval: None
 
 env:
   normalize_state: true
