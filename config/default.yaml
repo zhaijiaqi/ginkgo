@@ -33,15 +33,17 @@ ppo:
   update_interval: 256       # 网络参数每隔多少步更新一次
   hidden_sizes: [64, 64]     # 神经网络隐藏层大小列表, 如[64,64]为两层每层64单元
   max_grad_norm: 0.5         # 梯度裁剪最大范数
+  standardize_advantages: true  # 启用 advantage normalization（标准化优势函数）
+  lambda: 0.95               # GAE (Generalized Advantage Estimation) 的 lambda 参数
 
 train:
-  total_episodes: 500
-  eval_interval_episode: 20
+  total_episodes: 1000
+  eval_interval_episode: 100
   eval_interval: None
   eval_n_episodes: 5
-  save_interval_episode: 20
+  save_interval_episode: 100
   save_interval: None
 
 env:
-  normalize_state: true
+  normalize_state: false
   reward_at_each_iter: false  # 是否在每次CG迭代后发放奖励

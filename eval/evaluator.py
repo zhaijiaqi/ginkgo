@@ -139,10 +139,10 @@ def plot_precision_heatmap(
         print("Warning: No precision selection data. Skipping heatmap plot.")
         return
 
-    # Precision mapping: 0=fp64, 1=fp32, 2=tf32, 3=fp16, 4=bf16, 5=fp8
-    precision_names = ['fp64', 'fp32', 'tf32', 'fp16', 'bf16', 'fp8']
-    # precision_colors = ['#2e4e77', '#336e99', '#47a49d', '#6fbd8f', '#9acda2', '#ebf6e6']
-    precision_colors = ['#e66d50', '#f3a361', '#e7c66b', '#297270', '#299d8f', '#8ab07c']
+    # Precision mapping: 0=fp64, 1=fp32, 2=fp16, 3=fp8
+    precision_names = ['fp64', 'fp32', 'fp16', 'fp8']
+    # precision_colors = ['#2e4e77', '#336e99', '#6fbd8f', '#9acda2']
+    precision_colors = ['#e66d50', '#f3a361', '#299d8f', '#8ab07c']
 
     num_iterations = len(precision_history)
     # Ensure consistent tile count (take the largest per iteration if variable)
@@ -152,26 +152,26 @@ def plot_precision_heatmap(
     precision_matrix = np.zeros((num_iterations, max_tiles), dtype=int)
     
     # Count precision usage for calculating proportions
-    precision_counts = {i: 0 for i in range(6)}
+    precision_counts = {i: 0 for i in range(4)}
     total_selections = 0
 
     for iter_idx, actions in enumerate(precision_history):
         for tile_idx, action in enumerate(actions):
             if tile_idx < max_tiles:
                 precision_matrix[iter_idx, tile_idx] = action
-                if 0 <= action < 6:
+                if 0 <= action < 4:
                     precision_counts[action] += 1
                     total_selections += 1
 
     # Calculate proportions
     precision_proportions = {}
     if total_selections > 0:
-        for prec_idx in range(6):
+        for prec_idx in range(4):
             count = precision_counts[prec_idx]
             proportion = count / total_selections * 100
             precision_proportions[prec_idx] = proportion
     else:
-        precision_proportions = {i: 0.0 for i in range(6)}
+        precision_proportions = {i: 0.0 for i in range(4)}
 
     # Figure size (scales with tiles/iterations)
     # Calculate figure size to accommodate all tiles
@@ -193,7 +193,7 @@ def plot_precision_heatmap(
 
     # Custom colormap
     cmap = mcolors.ListedColormap(precision_colors)
-    bounds = [-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
+    bounds = [-0.5, 0.5, 1.5, 2.5, 3.5]
     norm = mcolors.BoundaryNorm(bounds, cmap.N)
 
     # Draw the heatmap
@@ -232,11 +232,11 @@ def plot_precision_heatmap(
     ax.tick_params(axis='x', labelsize=18)  # Increase x-axis tick font size
 
     # Colorbar with proportions displayed
-    cbar = plt.colorbar(im, ax=ax, ticks=[0, 1, 2, 3, 4, 5])
+    cbar = plt.colorbar(im, ax=ax, ticks=[0, 1, 2, 3])
     cbar.set_label('Precision Type', fontsize=24)
     # Format labels with precision name and proportion
     tick_labels = []
-    for prec_idx in range(6):
+    for prec_idx in range(4):
         prec_name = precision_names[prec_idx]
         prop = precision_proportions[prec_idx]
         tick_labels.append(f'{prec_name}\n({prop:.1f}%)')
@@ -436,7 +436,7 @@ def evaluate_model(model_path: str, matrix_name: Optional[str] = None,
         
         # 确定保存路径
         result_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else '.'
-        plot_filename = f"precision_heatmap_{int(time.time())}.png"
+        plot_filename = f"precision_heatmap_{matrix_name}.png"
         plot_path = os.path.join(result_dir, plot_filename)
         
         # 绘制热力图
@@ -487,7 +487,7 @@ def evaluate_model(model_path: str, matrix_name: Optional[str] = None,
 
     # 保存结果到JSON文件
     result_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else '.'
-    result_filename = f"evaluation_result_{int(time.time())}.json"
+    result_filename = f"evaluation_result_{matrix_name}.json"
     result_path = os.path.join(result_dir, result_filename)
     
     with open(result_path, 'w') as f:

@@ -45,6 +45,7 @@ class EvalHook:
 
         # 从环境中获取完整的episode信息
         episode_info = env.get_episode_info()
+        print(f"total_cost: {episode_info['total_cost']}, avg_tile_cost: {episode_info['avg_tile_cost']}")
 
         # 添加评估统计
         episode_stats = dict(eval_stats)  # 复制eval_stats

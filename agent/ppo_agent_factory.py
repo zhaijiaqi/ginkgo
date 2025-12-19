@@ -220,9 +220,9 @@ class CGPPOAgent:
     def eval_mode(self):
         """切换到评估模式"""
         for tile_agent in self.tile_agents:
-            print(f"Before mode switch: tile_agent.training: {tile_agent.training}")
+            # print(f"Before mode switch: tile_agent.training: {tile_agent.training}")
             tile_agent.eval_mode()
-            print(f"After mode switch: tile_agent.training: {tile_agent.training}")
+            # print(f"After mode switch: tile_agent.training: {tile_agent.training}")
 
     @property
     def training(self):

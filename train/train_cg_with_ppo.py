@@ -35,40 +35,6 @@ utils_spec.loader.exec_module(utils)
 from utils import TrainingLogger, TrainingStatsHook, EvalHook, convert_to_serializable
 
 
-def load_initial_x0(env_config: Dict, matrix_name: Optional[str], matrix_size: Optional[int]) -> Optional[np.ndarray]:
-    """
-    加载初始 x_0，如果加载失败则返回 None（使用默认的全1向量）
-
-    Args:
-        env_config: 环境配置
-        matrix_name: 矩阵名称
-        matrix_size: 矩阵大小
-
-    Returns:
-        initial_x: 初始解向量，如果加载失败返回 None
-    """
-    # 构建 x_0 文件路径（与矩阵文件在同一目录）
-    matrix_data_dir = os.path.expanduser(env_config.get('matrix_data_dir', '~/data/matrix'))
-    if matrix_name is not None and matrix_name != "None":
-        x0_filename = f"{matrix_name}_x0.npy"
-    else:
-        x0_filename = f"random_{matrix_size}_x0.npy"
-    x0_path = os.path.join(matrix_data_dir, x0_filename)
-
-    if os.path.exists(x0_path):
-        try:
-            # 加载 x_0 文件
-            initial_x = np.load(x0_path, allow_pickle=True)
-            print(f"📂 已加载初始 x_0 文件: {x0_path}，形状: {initial_x.shape}")
-            return initial_x
-        except Exception as e:
-            print(f"⚠️ 加载 x_0 文件失败: {x0_path}，错误: {e}，将使用默认初始值")
-            return None
-    else:
-        print(f"📂 未找到 x_0 文件: {x0_path}，将使用默认初始值")
-        return None
-
-
 def create_env_config(config: Dict) -> Dict:
     """
     从训练配置创建环境配置
@@ -107,7 +73,7 @@ def extract_train_config(config: Dict) -> Dict:
     """
     train_config = config.get('train', {})
     max_iter = config.get('cg', {}).get('max_iter', 1000)
-    total_episodes = train_config.get('total_episodes', 1000)
+    total_episodes = train_config.get('total_episodes', 100)
     total_steps = total_episodes * max_iter
 
     return {
@@ -152,16 +118,16 @@ class DoublePrecisionWrapperAgent:
             # 第一个episode强制使用双精度
             return 1.0
 
-        phase_1_end = int(self.total_episodes * 0.1)  # 前10%的episode
-        phase_2_end = int(self.total_episodes * 0.5)  # 前50%的episode
+        phase_1_end = int(self.total_episodes * 0.01)  # 前1%的episode
+        # phase_2_end = int(self.total_episodes * 0.01)  # 前50%的episode
 
         if episode_num <= phase_1_end:
             # 前10%的episode: 90%概率强制使用fp64
-            return 0.5
-        elif episode_num <= phase_2_end:
-            # 从10%到50%的episode: 概率从90%线性衰减到0%
-            progress = (episode_num - phase_1_end) / (phase_2_end - phase_1_end)
-            return 0.5 * (1.0 - progress)
+            return 0.9
+        # elif episode_num <= phase_2_end:
+        #     # 从10%到50%的episode: 概率从90%线性衰减到0%
+        #     progress = (episode_num - phase_1_end) / (phase_2_end - phase_1_end)
+        #     return 0.5 * (1.0 - progress)
         else:
             # 50%之后的episode: 完全由agent决定
             return 0.0
@@ -172,7 +138,7 @@ class DoublePrecisionWrapperAgent:
             # 纯双精度代理总是使用 fp64 (动作 0)
             return [0] * self.num_tiles
 
-        if self.is_force_dp_episode and self.training:
+        if self.is_force_dp_episode and self.tile_agents[0].training:
             # 当前episode被确定为强制双精度episode
             return [0] * self.num_tiles
         else:
@@ -238,7 +204,7 @@ class DoublePrecisionWrapperAgent:
         return self.ppo_agent.saved_attributes
 
 
-def run_double_precision_episode_with_agent(env: CGEnvironment, agent, initial_x: Optional[np.ndarray] = None) -> Dict:
+def run_double_precision_episode_with_agent(env: CGEnvironment, agent) -> Dict:
     """
     使用给定的代理运行双精度 episode 来确定合适的 max_iter
 
@@ -256,7 +222,7 @@ def run_double_precision_episode_with_agent(env: CGEnvironment, agent, initial_x
         agent.is_force_dp_episode = True
 
     # 重置环境开始 episode
-    obs = env.reset(initial_x=initial_x)
+    obs = env.reset()
     done = False
     total_reward = 0.0
     step_count = 0
@@ -278,7 +244,7 @@ def run_double_precision_episode_with_agent(env: CGEnvironment, agent, initial_x
         step_count += 1
 
         if step_count % 10 == 0:
-            print(f"双精度步骤 {step_count}: 残差 = {info['residual_norm']:.6e}")
+            print(f"双精度步骤 {step_count}: 相对残差 = {info['residual_norm_relative']:.6e}")
 
     # 获取 episode 统计信息
     episode_info = env.get_episode_info()
@@ -288,7 +254,8 @@ def run_double_precision_episode_with_agent(env: CGEnvironment, agent, initial_x
         'compute_cost': episode_info['total_cost'],
         'final_residual': episode_info['final_residual'],
         'converged': episode_info['converged'],
-        'avg_tile_cost': episode_info['avg_tile_cost']
+        'avg_tile_cost': episode_info['avg_tile_cost'],
+        'step_rewards': episode_info['step_rewards']
     }
 
     print("=== 双精度 episode 完成 ===")
@@ -296,7 +263,7 @@ def run_double_precision_episode_with_agent(env: CGEnvironment, agent, initial_x
     print(f"总计算成本: {result['compute_cost']:.6f}")
     print(f"最终残差: {result['final_residual']:.6e}")
     print(f"是否收敛: {result['converged']}")
-
+    print(f"总奖励: {total_reward}")
     return result
 
 
@@ -325,7 +292,6 @@ def train_cg_ppo(config: Dict):
     # 加载初始 x_0
     matrix_name = config.get('cg', {}).get('matrix_name')
     matrix_size = config.get('cg', {}).get('matrix_size')
-    initial_x = load_initial_x0(env_config, matrix_name, matrix_size)
 
     # 获取训练参数
     train_params = extract_train_config(config)
@@ -344,22 +310,23 @@ def train_cg_ppo(config: Dict):
     agent = PfrlCompatibleCGPPOAgent(wrapped_agent)
 
     # 运行初始双精度 episode 来确定合适的 max_iter
-    dp_result = run_double_precision_episode_with_agent(env, wrapped_agent, initial_x=initial_x)
+    dp_result = run_double_precision_episode_with_agent(env, wrapped_agent)
 
     # 更新 max_iter 为收敛 iterations 的 2 倍
     original_max_iter = config['cg']['max_iter']
-    new_max_iter = int(dp_result['iterations'] * 2)
+    new_max_iter = int(dp_result['iterations'] * 5)
     config['cg']['max_iter'] = max(new_max_iter, 10)  # 至少设置为 10
-    # 更新 eval_interval 和 save_interval
+    # 更新 eval_interval 和 save_interval 和 total_steps
     eval_interval_episode = config['train']['eval_interval_episode']
     save_interval_episode = config['train']['save_interval_episode']
     train_params['eval_interval'] = eval_interval_episode * config['cg']['max_iter']
     train_params['save_interval'] = save_interval_episode * config['cg']['max_iter']
+    train_params['total_steps'] = train_params['total_episodes'] * config['cg']['max_iter']
     
 
     print(f"更新 max_iter: {original_max_iter} -> {config['cg']['max_iter']}")
     print(f"双精度基准计算成本: {dp_result['compute_cost']:.6f}")
-    print("精度选择策略: 前10%的episode 90%概率使用fp64，后续逐渐衰减到50%时完全由agent决定")
+    print("精度选择策略: 前10%的episode 50%概率使用fp64，后续时完全由agent决定")
 
     # 重新创建环境（使用更新后的 max_iter）
     env_config = create_env_config(config)
@@ -463,12 +430,11 @@ def final_evaluation(log_dir: str, config: Dict):
     # 加载初始 x_0
     matrix_name = config.get('cg', {}).get('matrix_name')
     matrix_size = config.get('cg', {}).get('matrix_size')
-    initial_x = load_initial_x0(env_config, matrix_name, matrix_size)
 
     # 1. 双精度 baseline 评估
     print("\n📊 运行双精度 baseline 评估...")
     dp_agent = DoublePrecisionWrapperAgent(num_tiles=num_tiles)  # 纯双精度代理
-    dp_result = run_double_precision_episode_with_agent(env, dp_agent, initial_x=initial_x)
+    dp_result = run_double_precision_episode_with_agent(env, dp_agent)
 
     # 2. 训练后模型评估
     print("\n🤖 运行训练后模型评估...")
@@ -483,7 +449,7 @@ def final_evaluation(log_dir: str, config: Dict):
     pfrl_agent = PfrlCompatibleCGPPOAgent(cg_agent)
 
     # 运行评估 episode
-    obs = env.reset(initial_x=initial_x)
+    obs = env.reset()
     done = False
     trained_cost = 0.0
     step_count = 0

@@ -417,9 +417,9 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                 action == 1,  # float32
                 T.float64(3.4e38),
                 T.if_then_else(
-                    action == 2,  # float16
-                    T.float64(65504.0),  # FP16 max
-                    T.float64(448.0),    # FP8 E4M3 max
+                    action == 2,  # bfloat16
+                    T.float64(3.4e38),  # bfloat16 max
+                    T.float64(57344.0),    # float8_e5m2 max
                 ),
             ),
         )
@@ -433,13 +433,13 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                 value,  # float64 - no change
                 T.Cast("float64", T.Cast("float32", value)),  # float32
             ),
-            # action >= 2: true quantization for FP16 and FP8
+            # action >= 2: true quantization for bfloat16 and float8_e5m2
             T.if_then_else(
                 action == 2,
-                dequantize_value(T.Cast("float64", T.Cast("float16",
-                    T.max(T.min(scale * value, max_val), -max_val))), scale),  # FP16 with scaling
-                dequantize_value(T.Cast("float64", T.Cast("float8_e4m3",
-                    T.max(T.min(scale * value, max_val), -max_val))), scale),  # FP8 with scaling
+                dequantize_value(T.Cast("float64", T.Cast("bfloat16",
+                    T.max(T.min(scale * value, max_val), -max_val))), scale),  # bfloat16 with scaling
+                dequantize_value(T.Cast("float64", T.Cast("float8_e5m2",
+                    T.max(T.min(scale * value, max_val), -max_val))), scale),  # float8_e5m2 with scaling
             ),
         )
 
