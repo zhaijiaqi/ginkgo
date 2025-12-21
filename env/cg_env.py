@@ -661,57 +661,65 @@ class CGEnvironment:
         cg_math_end_time = time.time()
         self.performance_stats['cg_math_time'] += (cg_math_end_time - cg_math_start_time)
 
-        # ===== 新的 reward 计算逻辑 =====
-        # 1. 残差下降奖励 (R_progress)：step-wise log 残差下降
-        progress_reward = self.w1 * math.log(prev_residual_norm / residual_norm)
+        # # ===== 新的 reward 计算逻辑 =====
+        # # 1. 残差下降奖励 (R_progress)：step-wise log 残差下降
+        # progress_reward = self.w1 * math.log(prev_residual_norm / residual_norm)
 
-        # 2. 计算代价惩罚 (R_cost)：鼓励使用低精度
-        cost_penalty = -self.w2 * (iteration_cpt_cost / num_tiles)
+        # # 2. 计算代价惩罚 (R_cost)：鼓励使用低精度
+        # cost_penalty = -self.w2 * (iteration_cpt_cost / num_tiles)
 
-        # 3. 收敛终止奖励 (R_converge)：只在真正收敛时给予
-        convergence_reward = self.w3 * converged
+        # # 3. 收敛终止奖励 (R_converge)：只在真正收敛时给予
+        # convergence_reward = self.w3 * converged
 
-        # 4. 数值失败惩罚 (R_failure)：检测多种失败情况
-        failure_penalty = 0.0
-        if residual_norm > 2.0 * self.initial_residual_norm or residual_norm > prev_residual_norm * 1.2: # 持续的残差上升惩罚
-            failure_penalty = -self.w4
-        if not np.isfinite(residual_norm): # 检查 NaN/Inf
-            failure_penalty = -self.w4 * 5
+        # # 4. 数值失败惩罚 (R_failure)：检测多种失败情况
+        # failure_penalty = 0.0
+        # if residual_norm > 2.0 * self.initial_residual_norm or residual_norm > prev_residual_norm * 1.2: # 持续的残差上升惩罚
+        #     failure_penalty = -self.w4
+        # if not np.isfinite(residual_norm): # 检查 NaN/Inf
+        #     failure_penalty = -self.w4 * 5
              
-        # 5. 发散惩罚
-        diverged_penalty = -self.max_iter * 10 if diverged else 0
+        # # 5. 发散惩罚
+        # diverged_penalty = -self.max_iter * 10 if diverged else 0
 
-        # 计算总奖励
-        iteration_reward = progress_reward + cost_penalty + convergence_reward + failure_penalty + diverged_penalty
+        # # 计算总奖励
+        # iteration_reward = progress_reward + cost_penalty + convergence_reward + failure_penalty + diverged_penalty
 
-        # if self.current_iteration % 10 == 0 or done:
-        #     print("")
-        #     print("================================================")
-        #     print(f"当前迭代次数: {self.current_iteration}")
-        #     print(f"当前迭代残差: {residual_norm}")
-        #     print(f"当前相对残差：{residual_norm/self.b_norm}")
-        #     print(f"当前迭代每tile平均计算成本: {iteration_cpt_cost/num_tiles}")
-        #     print(f"当前迭代是否收敛: {converged}")
-        #     print(f"1.残差下降奖励 (R_progress): {progress_reward}")
-        #     print(f"2.计算代价惩罚 (R_cost):     {cost_penalty}")
-        #     print(f"3.数值失败惩罚 (R_failure):  {failure_penalty}")
-        #     print(f"4.发散惩罚     (R_diverged):{diverged_penalty}")
-        #     print(f"5.收敛终止奖励 (R_converge): {convergence_reward}")
-        #     print(f"总奖励:                 : {iteration_reward}")
-        #     # 统计每种精度选择的数量
-        #     from collections import Counter
-        #     precisions_to_test = [
-        #         ('fp64', 0),
-        #         ('fp32', 1),
-        #         ('fp16', 2),
-        #         ('fp8', 3)
-        #     ]
-        #     precision_code_to_name = {code: name for name, code in precisions_to_test}
-        #     precision_counts = Counter(int(a) for a in actions)
-        #     print("每种精度选择数量:")
-        #     for precision_code, count in sorted(precision_counts.items()):
-        #         precision_name = precision_code_to_name.get(precision_code, f"未知({precision_code})")
-        #         print(f"  精度 {precision_name}: {count} 个")
+        
+        progress_reward = self.w1 * math.log(prev_residual_norm / residual_norm)
+        cost_penalty = -self.w2 * (iteration_cpt_cost / num_tiles)
+        convergence_reward = (self.max_iter - self.current_iteration) * converged
+        
+        iteration_reward = progress_reward + cost_penalty + convergence_reward
+
+
+        if self.current_iteration % 100 == 0 or done:
+            print("")
+            print("================================================")
+            print(f"当前迭代次数: {self.current_iteration}")
+            print(f"当前迭代残差: {residual_norm}")
+            print(f"当前相对残差：{residual_norm/self.b_norm}")
+            print(f"当前迭代每tile平均计算成本: {iteration_cpt_cost/num_tiles}")
+            print(f"当前迭代是否收敛: {converged}")
+            print(f"1.残差下降奖励 (R_progress): {progress_reward}")
+            print(f"2.计算代价惩罚 (R_cost):     {cost_penalty}")
+            # print(f"3.数值失败惩罚 (R_failure):  {failure_penalty}")
+            # print(f"4.发散惩罚     (R_diverged):{diverged_penalty}")
+            print(f"5.收敛终止奖励 (R_converge): {convergence_reward}")
+            print(f"总奖励:                 : {iteration_reward}")
+            # 统计每种精度选择的数量
+            from collections import Counter
+            precisions_to_test = [
+                ('fp64', 0),
+                ('fp32', 1),
+                ('fp16', 2),
+                ('fp8', 3)
+            ]
+            precision_code_to_name = {code: name for name, code in precisions_to_test}
+            precision_counts = Counter(int(a) for a in actions)
+            print("每种精度选择数量:")
+            for precision_code, count in sorted(precision_counts.items()):
+                precision_name = precision_code_to_name.get(precision_code, f"未知({precision_code})")
+                print(f"  精度 {precision_name}: {count} 个")
 
         # 检查是否结束
         if not done:
@@ -777,7 +785,7 @@ class CGEnvironment:
         p_dot_Ap = self.math_sim.vector_dot(self.p, self.Ap)
         diverged = False
 
-        if p_dot_Ap <= 1e-300:  # 使用更小的阈值来检测数值问题
+        if p_dot_Ap <= 1e-307:  # 使用更小的阈值来检测数值问题
             # Ap 与 p 不正交或数值不稳定，算法发散
             print("⚠️  WARNING: Ap is not orthogonal to p or numerical instability detected. The algorithm has diverged.")
             diverged = True

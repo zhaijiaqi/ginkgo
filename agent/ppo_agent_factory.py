@@ -13,16 +13,6 @@ import os
 import logging
 import time
 
-from models import create_cg_model
-
-
-# 为了向后兼容，保留这个函数
-def create_cg_model(state_dim: int, action_size: int, hidden_sizes=(64, 64)):
-    """创建CG模型的向后兼容函数"""
-    from models.cg_model import create_cg_model as _create_cg_model
-    return _create_cg_model(state_dim, action_size, hidden_sizes)
-
-
 class CGPPOAgent:
     """
     为CG环境定制的PPO代理
@@ -77,17 +67,20 @@ class CGPPOAgent:
             layers.append(nn.Linear(prev_size, action_size))
             policy_net = nn.Sequential(*layers)
 
-            # 添加数值稳定性：确保最后一层权重初始化更保守
+            # 数值稳定性改进：最后一层使用合理的初始化
             if layers and isinstance(layers[-1], nn.Linear):
                 with torch.no_grad():
-                    # 将最后一层的权重初始化为很小的值
-                    layers[-1].weight.data *= 0.01
+                    # 最后一层使用标准初始化，避免过小
+                    nn.init.orthogonal_(layers[-1].weight, gain=0.1)  # 增大增益
                     layers[-1].bias.data.fill_(0.0)
 
-            # 初始化权重 - 使用更小的增益以提高数值稳定性
+            # 初始化权重 - 为策略网络使用更合适的增益
             for layer in policy_net:
                 if isinstance(layer, nn.Linear):
-                    nn.init.orthogonal_(layer.weight, gain=0.01)  # 减小增益
+                    if layer == layers[-1]:  # 最后一层已经初始化过了
+                        continue
+                    # 隐藏层使用标准初始化
+                    nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
                     nn.init.constant_(layer.bias, 0.0)
 
             return policy_net
@@ -123,44 +116,63 @@ class CGPPOAgent:
         model = pfrl.nn.Branched(policy_with_dist, value)
         return model
 
+    # def act(self, obs):
+    #     """为每个tile独立选择动作（参数共享的代理）- 优化批量推理"""
+    #     # 直接将连续的obs数组重塑为批量形式，避免切分/合并开销
+    #     obs_array = np.asarray(obs, dtype=np.float32)
+    #     batch_obs = obs_array.reshape(self.num_tiles, self.tile_state_dim)
+    #     batch_obs = torch.from_numpy(batch_obs)
+
+    #     # 使用共享模型进行推理（所有代理共享相同模型）
+    #     model = self.tile_agents[0].model
+    #     device = next(model.parameters()).device
+    #     batch_obs = batch_obs.to(device)
+
+    #     # 前向传播获取策略分布
+    #     with torch.no_grad():
+    #         policy_out, _ = model(batch_obs)
+    #         logits = policy_out.logits
+
+    #         # 添加数值稳定性检查
+    #         if torch.isnan(logits).any() or torch.isinf(logits).any():
+    #             print(f"警告: 检测到无效的logits值 - NaN: {torch.isnan(logits).any()}, Inf: {torch.isinf(logits).any()}")
+    #             print(f"logits范围: min={logits.min().item():.6f}, max={logits.max().item():.6f}")
+    #             # 使用均匀分布作为fallback
+    #             logits = torch.zeros_like(logits)
+
+    #         policy_out = torch.distributions.Categorical(logits=logits)
+
+    #         # policy_out 是批量分类分布，从中采样动作
+    #         actions = policy_out.sample().cpu().numpy()
+
+    #     # 为每个代理设置状态（模拟act方法的行为）
+    #     for tile_idx in range(self.num_tiles):
+    #         agent = self.tile_agents[tile_idx]
+
+    #         # 初始化batch变量（如果还没有初始化）
+    #         if agent.batch_last_episode is None:
+    #             agent._initialize_batch_variables(1)
+
+    #         # 设置上一次的状态和动作（模拟pfrl act方法的行为）
+    #         # 从原始obs中提取对应tile的观测
+    #         start_idx = tile_idx * self.tile_state_dim
+    #         end_idx = start_idx + self.tile_state_dim
+    #         tile_obs = obs[start_idx:end_idx]
+    #         agent.batch_last_state = [tile_obs]
+    #         agent.batch_last_action = [actions[tile_idx]]
+
+    #     return actions.tolist()  # 转换为列表以保持接口一致性
+    
     def act(self, obs):
-        """为每个tile独立选择动作（参数共享的代理）- 优化批量推理"""
-        # 直接将连续的obs数组重塑为批量形式，避免切分/合并开销
-        obs_array = np.asarray(obs, dtype=np.float32)
-        batch_obs = obs_array.reshape(self.num_tiles, self.tile_state_dim)
-        batch_obs = torch.from_numpy(batch_obs)
-
-        # 使用共享模型进行推理（所有代理共享相同模型）
-        model = self.tile_agents[0].model
-        device = next(model.parameters()).device
-        batch_obs = batch_obs.to(device)
-
-        # 前向传播获取策略分布
-        with torch.no_grad():
-            policy_out, _ = model(batch_obs)
-            logits = policy_out.logits
-            policy_out = torch.distributions.Categorical(logits=logits)
-
-            # policy_out 是批量分类分布，从中采样动作
-            actions = policy_out.sample().cpu().numpy()
-
-        # 为每个代理设置状态（模拟act方法的行为）
+        """为每个tile独立选择动作（参数共享的代理）- 优化推理"""
+        actions = []
         for tile_idx in range(self.num_tiles):
-            agent = self.tile_agents[tile_idx]
-
-            # 初始化batch变量（如果还没有初始化）
-            if agent.batch_last_episode is None:
-                agent._initialize_batch_variables(1)
-
-            # 设置上一次的状态和动作（模拟pfrl act方法的行为）
-            # 从原始obs中提取对应tile的观测
             start_idx = tile_idx * self.tile_state_dim
             end_idx = start_idx + self.tile_state_dim
             tile_obs = obs[start_idx:end_idx]
-            agent.batch_last_state = [tile_obs]
-            agent.batch_last_action = [actions[tile_idx]]
-
-        return actions.tolist()  # 转换为列表以保持接口一致性
+            action = self.tile_agents[tile_idx].act(tile_obs)
+            actions.append(action)
+        return actions
 
     def observe(self, obs, reward, done, reset):
         """观察多tile环境的转换（参数共享的代理）"""

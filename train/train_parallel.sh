@@ -2,13 +2,13 @@
 
 # 并行训练脚本：分批运行CG PPO训练任务，每次最多12个并发（4张GPU，每张GPU平均3个任务）
 # 用法: ./train_parallel.sh [矩阵名称1] [矩阵名称2] ...
-# 如果不提供参数，则从training_matrices.csv读取所有矩阵
+# 如果不提供参数，则从cg_results.csv读取所有矩阵
 
 set -e  # 遇到错误立即退出
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TRAIN_SCRIPT="${PROJECT_ROOT}/train/train_cg_with_ppo.py"
-MATRIX_CSV="${PROJECT_ROOT}/training_matrices.csv"
+MATRIX_CSV="${PROJECT_ROOT}/cg_results.csv"
 CONFIG_FILE="${PROJECT_ROOT}/config/default.yaml"
 
 # 默认并发数：4张GPU，每张GPU训练3个数据集
@@ -224,7 +224,7 @@ show_usage() {
 并行训练脚本：同时至多运行12个CG PPO训练任务（4张GPU，每张GPU训练3个数据集）
 
 用法:
-  $0                    # 从training_matrices.csv读取所有矩阵并训练
+  $0                    # 从cg_results.csv读取所有矩阵并训练
   $0 matrix1 matrix2    # 只训练指定的矩阵
   $0 --help             # 显示此帮助信息
 

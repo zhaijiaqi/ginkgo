@@ -123,7 +123,7 @@ class DoublePrecisionWrapperAgent:
 
         if episode_num <= phase_1_end:
             # 前10%的episode: 90%概率强制使用fp64
-            return 0.9
+            return 1.0
         # elif episode_num <= phase_2_end:
         #     # 从10%到50%的episode: 概率从90%线性衰减到0%
         #     progress = (episode_num - phase_1_end) / (phase_2_end - phase_1_end)
@@ -140,6 +140,7 @@ class DoublePrecisionWrapperAgent:
 
         if self.is_force_dp_episode and self.tile_agents[0].training:
             # 当前episode被确定为强制双精度episode
+            self.ppo_agent.act(obs) # 假装使用PPO代理选择动作，实际上不使用
             return [0] * self.num_tiles
         else:
             # 使用 PPO 代理的动作
@@ -151,15 +152,8 @@ class DoublePrecisionWrapperAgent:
         if self.ppo_agent is None:
             return
 
-        # 评估阶段不执行强制双精度逻辑，直接调用底层代理的observe
-        if not self.training:
-            self.ppo_agent.observe(obs, reward, done, reset)
-            return
-
-        # 训练阶段：只有在非强制双精度episode时才记录数据到PPO代理
-        if not self.is_force_dp_episode:
-            # 正常观察
-            self.ppo_agent.observe(obs, reward, done, reset)
+        # 无论如何都要观察
+        self.ppo_agent.observe(obs, reward, done, reset)
 
         # 在episode结束时处理episode计数和下一episode的强制双精度决策
         if done:
@@ -326,7 +320,7 @@ def train_cg_ppo(config: Dict):
 
     print(f"更新 max_iter: {original_max_iter} -> {config['cg']['max_iter']}")
     print(f"双精度基准计算成本: {dp_result['compute_cost']:.6f}")
-    print("精度选择策略: 前10%的episode 50%概率使用fp64，后续时完全由agent决定")
+    print("精度选择策略: 前10%的episode 50%概率使用fp64，后续逐渐减少到0%")
 
     # 重新创建环境（使用更新后的 max_iter）
     env_config = create_env_config(config)
