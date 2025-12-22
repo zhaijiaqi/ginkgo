@@ -20,7 +20,8 @@ def benchmark_kernel(
         start_events[i].record(stream=torch.cuda.current_stream())
         spmv_kernel(*kernel_args)
         end_events[i].record(stream=torch.cuda.current_stream())
-        torch.cuda.synchronize()
+    # 只在整轮结束后同步一次，避免把同步开销算进每次迭代
+    torch.cuda.synchronize()
 
     times_ms = [start_events[i].elapsed_time(end_events[i]) for i in range(iters)]
 

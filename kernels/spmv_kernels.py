@@ -723,8 +723,8 @@ def bench_bsr_spmv_mixed():
         spmv_kernel_warp_reduce,
         (data_t, actions_t, indices_t, indptr_t, x_t, y_t),
         nnz,
-        warmup=10,
-        iters=100,
+        warmup=50,
+        iters=1000,
     )
     
     
