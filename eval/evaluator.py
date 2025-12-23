@@ -20,7 +20,7 @@ import time
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Union, Any
 
 # 导入项目模块
 from env.cg_env import CGEnvironment
@@ -40,8 +40,65 @@ from utils import create_env_config, load_model_weights, DoublePrecisionAgent, c
 configure_matplotlib_chinese()
 
 
+def _safe_copy_vector(v: Any) -> Any:
+    """
+    安全拷贝向量，兼容 numpy / torch。
+    - torch.Tensor: clone().detach()
+    - numpy.ndarray: copy()
+    - 其他: 原样返回（避免意外 deep copy 带来开销/失败）
+    """
+    if v is None:
+        return None
+    if isinstance(v, torch.Tensor):
+        return v.clone().detach()
+    if isinstance(v, np.ndarray):
+        return v.copy()
+    return v
+
+
+def _apply_fixed_b_to_env(
+    env: CGEnvironment,
+    fixed_b: Union[np.ndarray, torch.Tensor, List[float]],
+) -> List[float]:
+    """
+    将 fixed_b 注入到环境中（环境当前默认 torch 常驻状态）。
+    返回注入后对应的初始观测（state features）。
+    """
+    dev = torch.device(getattr(env, "torch_device", "cpu"))
+    dtype = getattr(env, "torch_dtype", torch.float64)
+
+    if isinstance(fixed_b, torch.Tensor):
+        b_t = fixed_b.detach().clone().to(device=dev, dtype=dtype)
+        b_cpu = fixed_b.detach().cpu().numpy().astype(np.float64, copy=True)
+    else:
+        b_cpu = np.asarray(fixed_b, dtype=np.float64)
+        # 保证是独立拷贝，避免外部修改影响 env
+        b_cpu = np.array(b_cpu, dtype=np.float64, copy=True)
+        b_t = torch.as_tensor(b_cpu, device=dev, dtype=dtype)
+
+    if int(b_t.numel()) != int(env.matrix_size):
+        raise ValueError(f"fixed_b 长度({int(b_t.numel())})与 env.matrix_size({int(env.matrix_size)})不一致")
+
+    # 覆盖 b，并同步 CPU 缓存与范数
+    env.b = b_t
+    env.b_cpu = b_cpu
+    env.b_norm = float(torch.linalg.vector_norm(b_t, ord=2).item())
+
+    # 重新初始化 CG 状态：x0=0, r0=b, p0=r0
+    env.x = torch.zeros((env.matrix_size,), device=dev, dtype=dtype)
+    env.r = b_t.clone()
+    env.p = env.r.clone()
+    env.initial_residual_norm = float(torch.linalg.vector_norm(env.r, ord=2).item())
+
+    # 重置并记录初始残差
+    env.residual_tracker.reset()
+    env.residual_tracker.record_residual(env.initial_residual_norm)
+
+    return env.get_state_features(env.p, env.current_iteration)
+
+
 def run_episode_with_agent(env: CGEnvironment, agent, seed: int = 42, 
-                           fixed_b: Optional[np.ndarray] = None) -> Dict:
+                           fixed_b: Optional[Union[np.ndarray, torch.Tensor, List[float]]] = None) -> Dict:
     """
     使用给定的代理运行一个完整的 CG episode
 
@@ -63,18 +120,7 @@ def run_episode_with_agent(env: CGEnvironment, agent, seed: int = 42,
     
     # 如果提供了固定的b，使用它覆盖环境中的b
     if fixed_b is not None:
-        env.b = fixed_b.copy()
-        env.b_norm = np.linalg.norm(env.b)
-        # 重新计算初始残差
-        env.x = np.zeros(env.matrix_size)
-        env.r = env._compute_exact_residual(env.x, env.A_matrix, env.b)
-        env.p = env.r.copy()
-        # 重新记录初始残差
-        initial_residual_norm = env.math_sim.vector_norm(env.r)
-        env.residual_tracker.reset()
-        env.residual_tracker.record_residual(initial_residual_norm)
-        # 重新获取状态
-        obs = env.get_state_features(env.p, env.current_iteration)
+        obs = _apply_fixed_b_to_env(env, fixed_b)
     done = False
     total_reward = 0.0
     step_count = 0
@@ -349,8 +395,8 @@ def evaluate_model(model_path: str, matrix_name: Optional[str] = None,
     print(f"  - 平均 tile 成本: {dp_result['avg_tile_cost']:.6f}")
     print(f"  - 运行时间: {dp_time:.2f} 秒")
 
-    # 保存b的值，以便第二次运行使用相同的b
-    saved_b = env.b.copy() if hasattr(env, 'b') and env.b is not None else None
+    # 保存b的值，以便第二次运行使用相同的b（兼容 torch/numpy）
+    saved_b = _safe_copy_vector(env.b) if hasattr(env, 'b') and env.b is not None else None
     if saved_b is not None:
         print(f"  - 保存b向量用于第二次运行 (长度: {len(saved_b)})")
 

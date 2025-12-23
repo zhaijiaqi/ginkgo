@@ -378,7 +378,8 @@ class PPOAgentFactory:
             value_func_coef=self.ppo_config.get('value_coef', 0.5),            # 值函数损失系数
             entropy_coef=self.ppo_config.get('entropy_coef', 0.01),            # 熵奖励系数
             update_interval=self.ppo_config.get('update_interval', 1),         # 参数更新间隔
-            minibatch_size=self.ppo_config.get('minibatch_size', 64),          # 小批量样本数
+            # 兼容旧配置键：有些配置文件使用 batch_size 表示 minibatch_size
+            minibatch_size=self.ppo_config.get('minibatch_size', self.ppo_config.get('batch_size', 64)),  # 小批量样本数
             epochs=self.ppo_config.get('n_epochs', 10),                        # 每 update 的 epoch 数
             clip_eps=self.ppo_config.get('clip_eps', 0.2),                     # 策略裁剪参数
             clip_eps_vf=self.ppo_config.get('clip_eps_vf', None),              # 值函数裁剪参数

@@ -2,7 +2,7 @@
 
 # 从 cg_results.csv 读取所有 matrix_name 并按顺序执行评估
 
-MODEL_PATH="/home/bingxing2/home/scx7axu/program/rlcg/log/mesh3e1_tilesize64_20251219_142636/best_shared/model.pt"
+MODEL_PATH="/home/bingxing2/home/scx7axu/program/rlcg/log/backup/251221/mesh2e1_tilesize64_20251221_174355/best_shared/model.pt"
 CSV_FILE="cg_results.csv"
 EVALUATOR_SCRIPT="eval/evaluator.py"
 

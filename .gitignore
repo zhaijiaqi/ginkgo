@@ -2,3 +2,4 @@ __pycache__/
 log/
 .vscode/
 eval_*/
+nsys_profiles_all/
