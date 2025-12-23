@@ -140,7 +140,20 @@ class DoublePrecisionWrapperAgent:
             # 纯双精度代理总是使用 fp64 (动作 0)
             return [0] * self.num_tiles
 
-        if self.is_force_dp_episode and self.tile_agents[0].training:
+        # 兼容：某些配置/初始化异常可能导致 tile_agents 为空，避免直接索引崩溃
+        is_training = False
+        try:
+            if hasattr(self.ppo_agent, "training"):
+                is_training = bool(self.ppo_agent.training)
+        except Exception:
+            is_training = False
+        try:
+            if self.tile_agents and hasattr(self.tile_agents[0], "training"):
+                is_training = bool(self.tile_agents[0].training)
+        except Exception:
+            pass
+
+        if self.is_force_dp_episode and is_training:
             # 当前episode被确定为强制双精度episode
             self.ppo_agent.act(obs) # 假装使用PPO代理选择动作，实际上不使用
             return [0] * self.num_tiles

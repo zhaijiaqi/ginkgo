@@ -162,7 +162,7 @@ def run_fp8_evaluation(matrix_name: Optional[str] = None,
         env_dp.residual_tracker.reset()
         env_dp.residual_tracker.record_residual(initial_residual_norm)
         # 重新获取状态
-        obs = env_dp.get_state_features(env_dp.p, env_dp.current_iteration)
+        obs = env_dp.get_state_features(env_dp.p)
 
     done = False
     step_count = 0

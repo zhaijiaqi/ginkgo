@@ -155,11 +155,12 @@ class CGEnvironment:
         # 重置环境
         self.reset()
 
-        # 状态空间维度
-        tilesize = self.spmv_sim.tilesize
-        num_tiles = (self.matrix_size + tilesize - 1) // tilesize  # 向上取整计算 tile 数量
-        # 计算实际状态维度：考虑最后一个 tile 可能不是完整 tilesize
-        self.state_dim = num_tiles * (tilesize + 1)   # 每个 tile 的状态维度 = tilesize + 1（迭代索引）
+        # 状态空间维度（必须与 reset()/step() 返回的 obs 长度一致）
+        # 当前实现：观测 = 所有 tile 的 p 子向量拼接；每个 tile 固定 tilesize 维（最后一个 tile 不足会补 0）。
+        tilesize = int(self.spmv_sim.tilesize)
+        self.tile_state_dim = tilesize
+        self.num_tiles = (int(self.matrix_size) + tilesize - 1) // tilesize  # 向上取整计算 tile 数量
+        self.state_dim = int(self.num_tiles * self.tile_state_dim)
 
     def _load_matrix_info(self) -> Dict[str, Any]:
         """
@@ -449,38 +450,32 @@ class CGEnvironment:
         r = (np.asarray(b) - np.asarray(Ax)).astype(np.float64)
         return r
 
-    def _extract_state_features(self, sub_p: np.ndarray, iteration: int) -> List[float]:
+    def _extract_state_features(self, sub_p: np.ndarray) -> List[float]:
         """
         提取状态特征向量
 
         Args:
             sub_p: tile 对应的子向量
-            iteration: 当前 CG 迭代次数
 
         Returns:
             状态特征向量
         """
-        features = []
+        features: List[float] = []
 
         # 原始子向量
         if hasattr(sub_p, 'tolist'):
             features.extend(sub_p.tolist())
         else:
             features.extend(sub_p)
-
-        # 迭代索引（归一化）
-        norm_iter = iteration / self.max_iter
-        features.append(norm_iter)
-
         # 标准化
         if self.normalize_state:
-            # 对向量部分进行标准化（保留统计特征的尺度）
-            vector_part = features[:len(sub_p)]
-            if vector_part:
-                vec_mean = sum(vector_part) / len(vector_part)
-                vec_std = math.sqrt(sum((v - vec_mean)**2 for v in vector_part) / len(vector_part))
-                if vec_std > 0:
-                    features[:len(sub_p)] = [(v - vec_mean) / vec_std for v in vector_part]
+            arr = np.asarray(features, dtype=np.float32)
+            mean = float(np.mean(arr))
+            std = float(np.std(arr))
+            if std < 1e-12:
+                std = 1e-12
+            arr = (arr - mean) / std
+            features = arr.tolist()
 
         return features
     
@@ -543,7 +538,7 @@ class CGEnvironment:
         print(f"fp64 基准时间已测量: {self.fp64_baseline_time:.2f} ms")
 
     
-    def get_state_features(self, p: np.ndarray, iteration: int) -> List[float]:
+    def get_state_features(self, p: np.ndarray) -> List[float]:
         """
         获取状态特征向量
         """
@@ -563,7 +558,7 @@ class CGEnvironment:
             # 如果最后一个 tile 不足 tilesize，则补0
             if len(sub_p) < tilesize:
                 sub_p = np.concatenate([sub_p, np.zeros(tilesize - len(sub_p))])
-            tile_state = self._extract_state_features(sub_p, self.current_iteration)
+            tile_state = self._extract_state_features(sub_p)
             state.extend(tile_state)
         return state
 
@@ -636,7 +631,13 @@ class CGEnvironment:
             'cache_misses': self.spmv_sim._cache_miss_count if hasattr(self.spmv_sim, '_cache_miss_count') else 0
         }
         
-        return self.get_state_features(self.p, self.current_iteration)
+        # matrix_size 可能在 _generate_problem() 后变化，确保维度元信息与观测一致
+        tilesize = int(self.spmv_sim.tilesize)
+        self.tile_state_dim = tilesize
+        self.num_tiles = (int(self.matrix_size) + tilesize - 1) // tilesize
+        self.state_dim = int(self.num_tiles * self.tile_state_dim)
+
+        return self.get_state_features(self.p)
 
     def step(self, actions: List[int]) -> Tuple[List[float], float, bool, Dict]:
         """
@@ -795,7 +796,7 @@ class CGEnvironment:
         # 准备下一个状态
         if not done:
             # 为下一个迭代的所有 tiles 提取状态
-            next_state = self.get_state_features(self.p, self.current_iteration)
+            next_state = self.get_state_features(self.p)
         else:
             # episode结束，返回重置后的状态
             # 注意：在评估模式下，pfrl会在评估钩子之后才调用reset，

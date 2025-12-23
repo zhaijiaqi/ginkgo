@@ -94,7 +94,7 @@ def _apply_fixed_b_to_env(
     env.residual_tracker.reset()
     env.residual_tracker.record_residual(env.initial_residual_norm)
 
-    return env.get_state_features(env.p, env.current_iteration)
+    return env.get_state_features(env.p)
 
 
 def run_episode_with_agent(env: CGEnvironment, agent, seed: int = 42, 

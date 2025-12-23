@@ -36,7 +36,7 @@ utils = importlib.util.module_from_spec(utils_spec)
 sys.modules["utils"] = utils
 utils_spec.loader.exec_module(utils)
 
-from utils import create_env_config, load_model_weights, configure_matplotlib_chinese
+from utils import create_env_config, load_model_weights, configure_matplotlib_chinese, convert_to_serializable
 
 # 设置matplotlib支持中文显示
 configure_matplotlib_chinese()
@@ -107,7 +107,7 @@ def run_episode_with_profiling(env: CGEnvironment, agent, seed: int = 42,
         initial_residual_norm = env.math_sim.vector_norm(env.r)
         env.residual_tracker.reset()
         env.residual_tracker.record_residual(initial_residual_norm)
-        obs = env.get_state_features(env.p, env.current_iteration)
+        obs = env.get_state_features(env.p)
     
     done = False
     step_count = 0

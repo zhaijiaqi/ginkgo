@@ -28,21 +28,14 @@ def create_mock_input(num_tiles: int, tile_state_dim: int):
     Returns:
         模拟的状态向量
     """
-    # 每个tile的状态包括：tile_size + 1（迭代索引）
-    # 这里我们创建一个合理的模拟数据
+    # 每个 tile 的状态就是 tilesize 维的向量片段（与 CGEnvironment.get_state_features 对齐）
 
     mock_state = []
 
     for tile_idx in range(num_tiles):
-        # 模拟tile的状态特征（例如：残差、当前精度等）
-        tile_features = np.random.rand(tile_state_dim - 1) * 2 - 1  # 归一化到[-1, 1]
-
-        # 迭代索引（假设在CG算法的不同迭代阶段）
-        iteration_idx = np.random.randint(0, 100)  # 迭代步数
-
-        # 组合tile状态
-        tile_state = np.concatenate([tile_features, [iteration_idx]])
-        mock_state.extend(tile_state)
+        # 模拟 tile 的状态特征（例如：p 子向量的归一化片段）
+        tile_features = np.random.rand(tile_state_dim) * 2 - 1  # 归一化到[-1, 1]
+        mock_state.extend(tile_features)
 
     return np.array(mock_state, dtype=np.float32)
 

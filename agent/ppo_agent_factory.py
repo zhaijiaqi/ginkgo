@@ -78,7 +78,11 @@ class CGPPOAgent:
                 with torch.no_grad():
                     # 最后一层使用标准初始化，避免过小
                     nn.init.orthogonal_(layers[-1].weight, gain=0.1)  # 增大增益
-                    layers[-1].bias.data.fill_(0.0)
+                    layers[-1].bias.data.fill_(1.0)
+                    # 关键：让初始策略倾向 action0（假设 action0=高精度）
+                    # 这里直接硬编码一个正偏置（logit 加成）；值越大越偏向 action0。
+                    if action_size > 0:
+                        layers[-1].bias.data[0] = 10.0
 
             # 初始化权重 - 为策略网络使用更合适的增益
             for layer in policy_net:
@@ -326,10 +330,15 @@ class PPOAgentFactory:
             配置好的 CGPPOAgent 代理
         """
         # 计算tile数量
-        # 假设每个tile的状态维度 = tilesize + 1（迭代索引）
+        # 假设每个 tile 的状态维度 = tilesize（与 CGEnvironment.get_state_features 对齐）
         tilesize = self.config.get('spmv', {}).get('tilesize', 32)  # 从配置中读取tilesize
-        tile_state_dim = tilesize + 1
+        tile_state_dim = tilesize
         num_tiles = state_dim // tile_state_dim
+        if num_tiles <= 0:
+            raise ValueError(
+                f"无法创建 CGPPOAgent：计算得到 num_tiles={num_tiles} (state_dim={state_dim}, tilesize={tilesize}). "
+                f"请检查环境的观测维度是否为 num_tiles*tilesize，以及配置中的 spmv.tilesize 是否与环境一致。"
+            )
 
         # 网络参数（传递给CGPPOAgent的子代理）
 
@@ -340,7 +349,7 @@ class PPOAgentFactory:
         # 创建 CG PPO 代理
         # 参数解释:
         # num_tiles: tile 的数量，每个 tile 拥有独立的子 PPO 代理
-        # tile_state_dim: 每个 tile 的状态维度（通常 = tilesize + 1，额外一维表示迭代步）
+        # tile_state_dim: 每个 tile 的状态维度（通常 = tilesize）
         # action_size: 动作空间大小，表示支持多少种混合精度动作
         # lr: 学习率 (learning rate)，用于优化代理神经网络
         # gpu: 使用的 GPU 设备编号（int），为 None 时使用 CPU

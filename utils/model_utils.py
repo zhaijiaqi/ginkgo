@@ -69,9 +69,19 @@ def detect_model_config(model_path: str) -> Optional[Dict]:
     
     # 尝试加载元数据
     metadata = _load_model_metadata(model_path)
+    def _infer_tilesize_from_tile_state_dim(tile_state_dim: int) -> int:
+        """
+        兼容旧模型（tile_state_dim=tilesize+1 含 iteration）与新模型（tile_state_dim=tilesize 不含 iteration）。
+        经验规则：若 tile_state_dim 比常见 tilesize（16/32/64/128/256）大 1，则认为旧格式。
+        """
+        common = {16, 32, 64, 128, 256}
+        if (tile_state_dim - 1) in common and tile_state_dim not in common:
+            return tile_state_dim - 1
+        return tile_state_dim
+
     if metadata:
-        model_tile_state_dim = metadata['tile_state_dim']
-        model_tilesize = model_tile_state_dim - 1
+        model_tile_state_dim = int(metadata['tile_state_dim'])
+        model_tilesize = _infer_tilesize_from_tile_state_dim(model_tile_state_dim)
         return {
             'tilesize': model_tilesize,
             'tile_state_dim': model_tile_state_dim,
@@ -88,7 +98,8 @@ def detect_model_config(model_path: str) -> Optional[Dict]:
             if has_model_keys:
                 model_tile_state_dim = _infer_tile_state_dim_from_weights(weights)
                 if model_tile_state_dim:
-                    model_tilesize = model_tile_state_dim - 1
+                    model_tile_state_dim = int(model_tile_state_dim)
+                    model_tilesize = _infer_tilesize_from_tile_state_dim(model_tile_state_dim)
                     return {
                         'tilesize': model_tilesize,
                         'tile_state_dim': model_tile_state_dim,
@@ -135,8 +146,8 @@ def load_model_weights(model_path: str, config: Dict, env: CGEnvironment):
         model_num_tiles = metadata['num_tiles']
         model_action_size = metadata['action_size']
         
-        # 计算模型训练时的tilesize
-        model_tilesize = model_tile_state_dim - 1  # tile_state_dim = tilesize + 1
+        # 计算模型训练时的 tilesize（兼容旧/新 state 定义）
+        model_tilesize = detect_model_config(model_path)["tilesize"] if detect_model_config(model_path) else model_tile_state_dim
         
         # 获取hidden_sizes（如果存在）
         model_hidden_sizes = metadata.get('hidden_sizes', [64, 64])
@@ -152,7 +163,8 @@ def load_model_weights(model_path: str, config: Dict, env: CGEnvironment):
         
         # 检查当前环境配置是否匹配
         current_tilesize = env.spmv_sim.tilesize
-        current_tile_state_dim = current_tilesize + 1
+        # 当前环境 state 已不包含 iteration，因此 tile_state_dim = tilesize
+        current_tile_state_dim = current_tilesize
         
         if current_tile_state_dim != model_tile_state_dim:
             print(f"\n⚠️  警告: 环境配置与模型不匹配!")
@@ -218,7 +230,7 @@ def load_model_weights(model_path: str, config: Dict, env: CGEnvironment):
         
         # 检查当前环境配置是否匹配
         current_tilesize = env.spmv_sim.tilesize
-        current_tile_state_dim = current_tilesize + 1
+        current_tile_state_dim = current_tilesize
         
         if current_tile_state_dim != model_tile_state_dim:
             print(f"\n⚠️  警告: 环境配置与模型不匹配!")

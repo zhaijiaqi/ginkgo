@@ -96,7 +96,7 @@ def run_episode_with_selector(env: CGEnvironment, selector_agent,
         initial_residual_norm = env.math_sim.vector_norm(env.r)
         env.residual_tracker.reset()
         env.residual_tracker.record_residual(initial_residual_norm)
-        obs = env.get_state_features(env.p, env.current_iteration)
+        obs = env.get_state_features(env.p)
     
     done = False
     step_count = 0
