@@ -57,7 +57,8 @@ def create_env_config(config: Dict) -> Dict:
             'fp64': 1.0, 'fp32': 0.5, 'fp16': 0.25, 'fp8': 0.125
         }),
         'reward': config.get('reward'),
-        'normalize_state': config.get('env', {}).get('normalize_state', True)
+        'normalize_state': config.get('env', {}).get('normalize_state', True),
+        'use_torch_state': config.get('env', {}).get('use_torch_state', True)
     }
 
 
@@ -118,21 +119,22 @@ class DoublePrecisionWrapperAgent:
             # 第一个episode强制使用双精度
             return 1.0
 
-        phase_1_end = int(self.total_episodes * 0.01)  # 前1%的episode
-        # phase_2_end = int(self.total_episodes * 0.01)  # 前50%的episode
+        # phase_1_end = int(self.total_episodes * 0.1)   # 前10%的episode
+        # phase_2_end = int(self.total_episodes * 0.3)   # 前30%的episode
 
-        if episode_num <= phase_1_end:
-            # 前10%的episode: 90%概率强制使用fp64
-            return 1.0
+        # if episode_num <= phase_1_end:
+            # 前10%的episode: 100%概率强制使用双精度
+            # return 0.5
         # elif episode_num <= phase_2_end:
-        #     # 从10%到50%的episode: 概率从90%线性衰减到0%
+        #     # 从10%到30%的episode: 概率从50%线性衰减到0%
         #     progress = (episode_num - phase_1_end) / (phase_2_end - phase_1_end)
-        #     return 0.5 * (1.0 - progress)
+        #     return 0.5 - 0.5 * progress
         else:
-            # 50%之后的episode: 完全由agent决定
-            return 0.0
+            # 30%之后的episode: 10%概率强制双精度，完全由agent决定
+            return 0
 
     def act(self, obs):
+        
         """根据概率策略选择是否强制使用双精度动作"""
         if self.ppo_agent is None:
             # 纯双精度代理总是使用 fp64 (动作 0)
@@ -151,23 +153,24 @@ class DoublePrecisionWrapperAgent:
         # 如果是纯双精度代理，不需要记录任何观察
         if self.ppo_agent is None:
             return
+        
+        # 如果是强制双精度episode且done，不记录观察，更新计数与标志
+        if self.is_force_dp_episode and done:
+            self.episode_count += 1
+            self.is_force_dp_episode = False
+            # 决定下一个episode是否强制双精度
+            if np.random.random() < self._get_force_dp_probability(self.episode_count + 1):
+                self.is_force_dp_episode = True
+            return 
 
-        # 无论如何都要观察
+        # 观察转换
         self.ppo_agent.observe(obs, reward, done, reset)
 
-        # 在episode结束时处理episode计数和下一episode的强制双精度决策
+        # episode结束时，更新计数和强制双精度标志
         if done:
             self.episode_count += 1
-
-            # 如果当前是强制双精度episode，重置标志
-            if self.is_force_dp_episode:
-                self.is_force_dp_episode = False
-
-            # 为下一个episode决定是否强制使用双精度
-            next_episode_num = self.episode_count + 1
-            force_probability = self._get_force_dp_probability(next_episode_num)
-
-            if np.random.random() < force_probability:
+            self.is_force_dp_episode = False
+            if np.random.random() < self._get_force_dp_probability(self.episode_count + 1):
                 self.is_force_dp_episode = True
 
 

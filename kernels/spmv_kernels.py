@@ -548,7 +548,16 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
 
 
 def bsr_spmv_mixed(
-    data_bsr, actions, indices_bsr, indptr_bsr, x, R, C, device="cuda", kernel_list=1
+    data_bsr,
+    actions,
+    indices_bsr,
+    indptr_bsr,
+    x,
+    R,
+    C,
+    device="cuda",
+    kernel_list=1,
+    return_torch: bool = True,
 ):
     """
     data_bsr   : (nnzb, R, C) float32 (numpy)
@@ -557,24 +566,46 @@ def bsr_spmv_mixed(
     x          : (N,) float32 (numpy)
     R, C       : block size
     """
-    data_bsr = np.asarray(data_bsr, dtype=np.float64)
-    actions = np.asarray(actions, dtype=np.int32)
-    indices_bsr = np.asarray(indices_bsr, dtype=np.int32)
-    indptr_bsr = np.asarray(indptr_bsr, dtype=np.int32)
-    x = np.asarray(x, dtype=np.float64)
-
-    nnzb = data_bsr.shape[0]
-    n_block_rows = indptr_bsr.shape[0] - 1
-    N = x.shape[0]
-    M = n_block_rows * R
-
-    # Move to device (torch tensors)
+    # 允许直接传入 torch.Tensor（避免每次 numpy->torch / H2D / D2H）
     dev = torch.device(device)
-    data_t = torch.from_numpy(data_bsr).to(dev)
-    actions_t = torch.from_numpy(actions).to(dev)
-    indices_t = torch.from_numpy(indices_bsr).to(dev)
-    indptr_t = torch.from_numpy(indptr_bsr).to(dev)
-    x_t = torch.from_numpy(x).to(dev)
+
+    if torch.is_tensor(data_bsr):
+        data_t = data_bsr.to(device=dev, dtype=torch.float64)
+        nnzb = int(data_t.shape[0])
+    else:
+        data_bsr = np.asarray(data_bsr, dtype=np.float64)
+        nnzb = int(data_bsr.shape[0])
+        data_t = torch.from_numpy(data_bsr).to(dev)
+
+    if torch.is_tensor(indptr_bsr):
+        indptr_t = indptr_bsr.to(device=dev, dtype=torch.int32)
+        n_block_rows = int(indptr_t.shape[0]) - 1
+    else:
+        indptr_bsr = np.asarray(indptr_bsr, dtype=np.int32)
+        n_block_rows = int(indptr_bsr.shape[0]) - 1
+        indptr_t = torch.from_numpy(indptr_bsr).to(dev)
+
+    if torch.is_tensor(indices_bsr):
+        indices_t = indices_bsr.to(device=dev, dtype=torch.int32)
+    else:
+        indices_bsr = np.asarray(indices_bsr, dtype=np.int32)
+        indices_t = torch.from_numpy(indices_bsr).to(dev)
+
+    if torch.is_tensor(actions):
+        actions_t = actions.to(device=dev, dtype=torch.int32)
+    else:
+        actions = np.asarray(actions, dtype=np.int32)
+        actions_t = torch.from_numpy(actions).to(dev)
+
+    if torch.is_tensor(x):
+        x_t = x.to(device=dev, dtype=torch.float64)
+        N = int(x_t.shape[0])
+    else:
+        x = np.asarray(x, dtype=np.float64)
+        N = int(x.shape[0])
+        x_t = torch.from_numpy(x).to(dev)
+
+    M = n_block_rows * R
     y_t = torch.zeros((M,), dtype=torch.float64, device=dev)
 
     # Build kernel specialized to these sizes
@@ -587,9 +618,11 @@ def bsr_spmv_mixed(
     # Run kernel
     spmv_kernel(data_t, actions_t, indices_t, indptr_t, x_t, y_t)
 
+    if return_torch:
+        return y_t
+
     # Back to numpy
-    y = y_t.cpu().numpy()
-    return y
+    return y_t.cpu().numpy()
 
 
 def test_bsr_spmv():

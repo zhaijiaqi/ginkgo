@@ -17,8 +17,8 @@ spmv:
 reward:
   type: weighted
   w1: 10  # 数值误差奖励权重
-  w2: 0.1  # 计算成本奖励权重
-  w3: 100.0 # 收敛性奖励权重
+  w2: 0.2  # 计算成本奖励权重
+  w3: 30.0 # 收敛性奖励权重
   w4: 2.0  # 发散惩罚权重
   # w1: 10
   # w2: 1
@@ -41,12 +41,14 @@ ppo:
   lambda: 0.95               # GAE (Generalized Advantage Estimation) 的 lambda 参数
 
 train:
-  total_episodes: 200
-  eval_interval_episode: 20
+  total_episodes: 1000
+  eval_interval_episode: 100
   eval_interval: None
   eval_n_episodes: 5
-  save_interval_episode: 100
+  save_interval_episode: 200
   save_interval: None
 
 env:
   normalize_state: true
+  use_torch_state: true
+  verbose: true

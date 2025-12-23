@@ -10,11 +10,12 @@ import random
 import csv
 import os
 import time
+import torch
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from simulator.cg_math_simulator import CGMathSimulator, CGResidualTracker
+from simulator.cg_math_simulator import CGResidualTracker
 from simulator.spmv_block_simulator import SpMVBlockSimulator, SparseMatrix
 
 from kernels.spmv_kernels import bsr_spmv_mixed
@@ -65,6 +66,11 @@ class CGEnvironment:
         self.w5 = reward_config.get('w5', 0.3)  # 高精度鼓励权重
         # 环境参数
         self.normalize_state = config.get('normalize_state', True)
+        self.verbose = bool(config.get('verbose', True))
+        # 默认启用 torch 常驻状态（去掉 numpy 路径）
+        self.use_torch_state = bool(config.get('use_torch_state', True))
+        self.torch_device = str(config.get('torch_device', 'cuda' if torch.cuda.is_available() else 'cpu'))
+        self.torch_dtype = torch.float64
 
         # 初始化模拟器
         spmv_config = {
@@ -72,7 +78,6 @@ class CGEnvironment:
             'precision_cost_table': config.get('precision_cost_table'),
             'random_seed': config.get('random_seed', 42)
         }
-        self.math_sim = CGMathSimulator()
         self.spmv_sim = SpMVBlockSimulator(spmv_config)
         self.residual_tracker = CGResidualTracker()
 
@@ -90,6 +95,7 @@ class CGEnvironment:
         self.p = None  # 搜索方向
         self.Ap = None  # A*p 向量
         self.b = None  # 右端项
+        self.b_cpu = None  # 右端项（CPU numpy 缓存，用于 _generate_problem 复用）
         self.b_norm = None  # 右端项范数
         self.initial_residual_norm = None  # 初始残差
 
@@ -107,6 +113,11 @@ class CGEnvironment:
         self.bsr_indptr = None  # BSR 行指针
         self.bsr_R = None  # BSR 行块大小
         self.bsr_C = None  # BSR 列块大小
+
+        # Torch 版本的 BSR 数据缓存（避免每步 numpy->torch / H2D）
+        self.bsr_data_t = None
+        self.bsr_indices_t = None
+        self.bsr_indptr_t = None
         
         # fp64 基准时间测量
         self.fp64_baseline_time = None  # fp64 计算 Ap 的基准时间（毫秒）
@@ -214,7 +225,7 @@ class CGEnvironment:
         """
         if self.matrix_loaded:
             # 矩阵已加载，直接返回缓存的数据
-            return self.A_matrix, self.b
+            return self.A_matrix, self.b_cpu
 
         if self.matrix_name is not None:
             # 加载真实的矩阵
@@ -236,9 +247,11 @@ class CGEnvironment:
                 
                 # 转换为 BSR 格式（用于 TileLang kernel）
                 self.bsr_data, self.bsr_indices, self.bsr_indptr, self.bsr_R, self.bsr_C = self._convert_matrix_to_bsr()
+                self._maybe_cache_bsr_torch()
 
                 self.matrix_loaded = True
-                self.b = b  # 将 b 缓存为属性，便于下次复用
+                self.b_cpu = b  # 将 b 缓存为 CPU numpy，便于下次复用
+                self.b = b
 
             except Exception as e:
                 print(f"Failed to load matrix '{self.matrix_name}': {e}")
@@ -265,8 +278,8 @@ class CGEnvironment:
             A_diagonal.append(diagonal)
 
         # 生成右端项 b，b 初始化为：每个A对应列元素之和（对于对角矩阵就是对角线元素的拷贝）
-        b = np.array(self.A_matrix.sum(axis=0)).flatten()
-        print(f"L2 norm of b: {self.math_sim.vector_norm(b)}")
+        # 随机对角矩阵：b 直接取对角线（避免依赖 self.A_matrix）
+        b = np.array(A_diagonal, dtype=np.float64)
 
         # 为随机矩阵创建稀疏矩阵表示（对角矩阵）
         self.A_sparse = SparseMatrix(self.matrix_size, self.matrix_size, self.matrix_size)
@@ -279,9 +292,28 @@ class CGEnvironment:
 
         # 转换为 BSR 格式（用于 TileLang kernel）
         self.bsr_data, self.bsr_indices, self.bsr_indptr, self.bsr_R, self.bsr_C = self._convert_matrix_to_bsr()
+        self._maybe_cache_bsr_torch()
 
         self.matrix_loaded = True
+        self.b_cpu = b
         return A_diagonal, b
+
+    def _maybe_cache_bsr_torch(self):
+        """
+        若启用 use_torch_state，则把 BSR 结构一次性搬到 torch_device，避免每步重复 H2D/D2H。
+        """
+        if not self.use_torch_state:
+            self.bsr_data_t = None
+            self.bsr_indices_t = None
+            self.bsr_indptr_t = None
+            return
+        if self.bsr_data is None or self.bsr_indices is None or self.bsr_indptr is None:
+            return
+        dev = torch.device(self.torch_device)
+        # data: float64, indices/indptr: int32
+        self.bsr_data_t = torch.as_tensor(np.asarray(self.bsr_data, dtype=np.float64), device=dev, dtype=torch.float64)
+        self.bsr_indices_t = torch.as_tensor(np.asarray(self.bsr_indices, dtype=np.int32), device=dev, dtype=torch.int32)
+        self.bsr_indptr_t = torch.as_tensor(np.asarray(self.bsr_indptr, dtype=np.int32), device=dev, dtype=torch.int32)
 
     def _csr_to_sparse_matrix(self, csr_mat) -> SparseMatrix:
         """
@@ -408,10 +440,13 @@ class CGEnvironment:
             残差向量 (numpy数组)
         """
 
+        # 兼容：x 可能是 torch.Tensor
+        if torch.is_tensor(x):
+            x = x.detach().to("cpu").numpy()
         Ax_np = A_matrix.dot(x)
         Ax = Ax_np
         # 计算 r = b - A*x
-        r = self.math_sim.vector_sub(b, Ax)
+        r = (np.asarray(b) - np.asarray(Ax)).astype(np.float64)
         return r
 
     def _extract_state_features(self, sub_p: np.ndarray, iteration: int) -> List[float]:
@@ -512,6 +547,11 @@ class CGEnvironment:
         """
         获取状态特征向量
         """
+        # 若 p 是 torch.Tensor（可能在 GPU），先一次性搬到 CPU，避免每个 tile 单独触发拷贝
+        if torch.is_tensor(self.p):
+            p_arr = self.p.detach().to(device="cpu").numpy()
+        else:
+            p_arr = self.p
         # 返回所有 tiles 的状态
         tilesize = self.spmv_sim.tilesize
         num_tiles = (self.matrix_size + tilesize - 1) // tilesize
@@ -519,7 +559,7 @@ class CGEnvironment:
         for tile_idx in range(num_tiles):
             start_idx = tile_idx * tilesize
             end_idx = start_idx + tilesize
-            sub_p = self.p[start_idx:end_idx]
+            sub_p = p_arr[start_idx:end_idx]
             # 如果最后一个 tile 不足 tilesize，则补0
             if len(sub_p) < tilesize:
                 sub_p = np.concatenate([sub_p, np.zeros(tilesize - len(sub_p))])
@@ -552,17 +592,23 @@ class CGEnvironment:
         self.episode_done = False
 
         # 生成新的问题（可能更新matrix_size）
-        self.A_matrix, self.b = self._generate_problem()
-        
-        self.b_norm = self.math_sim.vector_norm(self.b)
+        self.A_matrix, b_cpu = self._generate_problem()
 
-        # CG 初始化（确保使用更新后的matrix_size）
-        self.x = np.zeros(self.matrix_size)  # x0 = 0   
-        self.r = self._compute_exact_residual(self.x, self.A_matrix, self.b)  # r0 = b - A*x0
-        self.p = self.r.copy()  # p0 = r0
+        if not self.use_torch_state:
+            raise RuntimeError("当前版本已移除 numpy 状态路径，请启用 use_torch_state=True（默认）")
 
-        # 记录初始残差
-        self.initial_residual_norm = self.math_sim.vector_norm(self.r)
+        dev = torch.device(self.torch_device)
+        b_t = torch.as_tensor(np.asarray(b_cpu, dtype=np.float64), device=dev, dtype=self.torch_dtype)
+        # 默认也把 b 常驻为 torch（减少后续类型分支）
+        self.b = b_t
+        self.b_cpu = np.asarray(b_cpu, dtype=np.float64)
+        self.b_norm = float(torch.linalg.vector_norm(b_t, ord=2).item())
+
+        # CG 初始化：x0=0, r0=b, p0=r0（reset 时 x 恒为 0，因此等价于 exact residual）
+        self.x = torch.zeros((self.matrix_size,), device=dev, dtype=self.torch_dtype)
+        self.r = b_t.clone()
+        self.p = self.r.clone()
+        self.initial_residual_norm = float(torch.linalg.vector_norm(self.r, ord=2).item())
         self.residual_tracker.reset()
         self.residual_tracker.record_residual(self.initial_residual_norm)
 
@@ -617,8 +663,8 @@ class CGEnvironment:
         # 记录当前迭代的所有 tile 动作
         self.tile_actions = actions.copy()
 
-        # 初始化 Ap 向量（使用numpy数组提高性能）
-        self.Ap = np.zeros(self.matrix_size, dtype=np.float64)
+        # 初始化 Ap 向量：直接使用 torch 输出
+        self.Ap = None
 
         spmv_start_time = time.time()
 
@@ -626,21 +672,21 @@ class CGEnvironment:
         if self.bsr_data is None:
             raise RuntimeError("BSR 数据未初始化")
 
-        # 将 actions 转换为 numpy 数组
-        actions_np = np.array(actions, dtype=np.int32)
-
-        # 使用 TileLang kernel 执行 SpMV 计算
-        # time_start = time.time()
-        
-        # # 真实 kernel 版本
-        # print("self.p[:10]:", ["{:.2e}".format(v) for v in self.p[:10]])
+        dev = torch.device(self.torch_device)
+        actions_t = torch.as_tensor(actions, dtype=torch.int32, device=dev)
         self.Ap = bsr_spmv_mixed(
-            self.bsr_data, actions_np, self.bsr_indices, self.bsr_indptr,
-            self.p, self.bsr_R, self.bsr_C, device="cuda"
+            self.bsr_data_t if self.bsr_data_t is not None else self.bsr_data,
+            actions_t,
+            self.bsr_indices_t if self.bsr_indices_t is not None else self.bsr_indices,
+            self.bsr_indptr_t if self.bsr_indptr_t is not None else self.bsr_indptr,
+            self.p,
+            self.bsr_R,
+            self.bsr_C,
+            device=self.torch_device,
+            return_torch=True,
         )
-        # 裁剪 self.Ap 到实际矩阵大小，去掉 padding 的计算结果
-        if len(self.Ap) > self.matrix_size:
-            self.Ap = self.Ap[:self.matrix_size]
+        if int(self.Ap.shape[0]) > self.matrix_size:
+            self.Ap = self.Ap[: self.matrix_size]
 
         # 计算每个 tile 的计算成本，并累加得到迭代总成本
         iteration_cpt_cost = 0.0
@@ -687,39 +733,43 @@ class CGEnvironment:
         
         progress_reward = self.w1 * math.log(prev_residual_norm / residual_norm)
         cost_penalty = -self.w2 * (iteration_cpt_cost / num_tiles)
-        convergence_reward = (self.max_iter - self.current_iteration) * converged
+        convergence_reward = self.w3 * converged
         
         iteration_reward = progress_reward + cost_penalty + convergence_reward
 
 
         if self.current_iteration % 100 == 0 or done:
-            print("")
-            print("================================================")
-            print(f"当前迭代次数: {self.current_iteration}")
-            print(f"当前迭代残差: {residual_norm}")
-            print(f"当前相对残差：{residual_norm/self.b_norm}")
-            print(f"当前迭代每tile平均计算成本: {iteration_cpt_cost/num_tiles}")
-            print(f"当前迭代是否收敛: {converged}")
-            print(f"1.残差下降奖励 (R_progress): {progress_reward}")
-            print(f"2.计算代价惩罚 (R_cost):     {cost_penalty}")
-            # print(f"3.数值失败惩罚 (R_failure):  {failure_penalty}")
-            # print(f"4.发散惩罚     (R_diverged):{diverged_penalty}")
-            print(f"5.收敛终止奖励 (R_converge): {convergence_reward}")
-            print(f"总奖励:                 : {iteration_reward}")
-            # 统计每种精度选择的数量
-            from collections import Counter
-            precisions_to_test = [
-                ('fp64', 0),
-                ('fp32', 1),
-                ('fp16', 2),
-                ('fp8', 3)
-            ]
-            precision_code_to_name = {code: name for name, code in precisions_to_test}
-            precision_counts = Counter(int(a) for a in actions)
-            print("每种精度选择数量:")
-            for precision_code, count in sorted(precision_counts.items()):
-                precision_name = precision_code_to_name.get(precision_code, f"未知({precision_code})")
-                print(f"  精度 {precision_name}: {count} 个")
+            if not self.verbose:
+                # 静默模式：跳过大量调试输出（用于基准测试避免 I/O 干扰）
+                pass
+            else:
+                print("")
+                print("================================================")
+                print(f"当前迭代次数: {self.current_iteration}")
+                print(f"当前迭代残差: {residual_norm}")
+                print(f"当前相对残差：{residual_norm/self.b_norm}")
+                print(f"当前迭代每tile平均计算成本: {iteration_cpt_cost/num_tiles}")
+                print(f"当前迭代是否收敛: {converged}")
+                print(f"1.残差下降奖励 (R_progress): {progress_reward}")
+                print(f"2.计算代价惩罚 (R_cost):     {cost_penalty}")
+                # print(f"3.数值失败惩罚 (R_failure):  {failure_penalty}")
+                # print(f"4.发散惩罚     (R_diverged):{diverged_penalty}")
+                print(f"5.收敛终止奖励 (R_converge): {convergence_reward}")
+                print(f"总奖励:                 : {iteration_reward}")
+                # 统计每种精度选择的数量
+                from collections import Counter
+                precisions_to_test = [
+                    ('fp64', 0),
+                    ('fp32', 1),
+                    ('fp16', 2),
+                    ('fp8', 3)
+                ]
+                precision_code_to_name = {code: name for name, code in precisions_to_test}
+                precision_counts = Counter(int(a) for a in actions)
+                print("每种精度选择数量:")
+                for precision_code, count in sorted(precision_counts.items()):
+                    precision_name = precision_code_to_name.get(precision_code, f"未知({precision_code})")
+                    print(f"  精度 {precision_name}: {count} 个")
 
         # 检查是否结束
         if not done:
@@ -770,70 +820,75 @@ class CGEnvironment:
         return next_state, iteration_reward, done, info
 
 
-    def _complete_cg_iteration(self) -> Tuple[bool, float, bool, bool, float]:
+    def _complete_cg_iteration(self) -> Tuple[float, float, bool, bool, bool]:
         """
-        完成一次完整的 CG 迭代
+        完成一次完整的 CG 迭代（PyTorch 版本，保证与原实现数值路径一致）
 
         Returns:
-            (converged, residual_norm, done, diverged, prev_residual_norm) - 收敛状态、当前残差范数、是否结束、是否发散、上一个残差范数
+            (residual_norm, prev_residual_norm, converged, done, diverged)
         """
-        # 记录上一个残差范数（用于 step-wise reward 计算）
-        prev_residual_norm = self.math_sim.vector_norm(self.r)
+        if not (torch.is_tensor(self.r) and torch.is_tensor(self.p) and torch.is_tensor(self.x) and torch.is_tensor(self.Ap)):
+            raise RuntimeError("当前版本默认使用 torch 常驻状态：x/r/p/Ap 必须为 torch.Tensor。")
 
-        # 计算 alpha = (r^T r) / (p^T Ap)
-        r_dot_r = self.math_sim.vector_dot(self.r, self.r)
-        p_dot_Ap = self.math_sim.vector_dot(self.p, self.Ap)
+        r_t = self.r
+        p_t = self.p
+        x_t = self.x
+        Ap_t = self.Ap
+
+        # prev_residual_norm = ||r||
+        prev_residual_norm = float(torch.linalg.vector_norm(r_t, ord=2).item())
+
+        # r_dot_r / p_dot_Ap
+        r_dot_r_t = torch.dot(r_t, r_t)
+        p_dot_Ap_t = torch.dot(p_t, Ap_t)
+        p_dot_Ap = float(p_dot_Ap_t.item())
         diverged = False
 
-        if p_dot_Ap <= 1e-307:  # 使用更小的阈值来检测数值问题
-            # Ap 与 p 不正交或数值不稳定，算法发散
+        if p_dot_Ap <= 1e-307:
             print("⚠️  WARNING: Ap is not orthogonal to p or numerical instability detected. The algorithm has diverged.")
             diverged = True
             done = True
             converged = False
-            current_residual_norm = self.math_sim.vector_norm(self.r)
-            return  current_residual_norm, prev_residual_norm, converged, done, diverged
-        alpha = r_dot_r / p_dot_Ap
+            current_residual_norm = prev_residual_norm
+            return current_residual_norm, prev_residual_norm, converged, done, diverged
 
-        # 添加数值稳定性检查：防止alpha过大导致的数值爆炸
-        # if abs(alpha) > 1e6:
-        #     # alpha过大，可能是数值不稳定
-        #     return -self.w3, True
+        alpha_t = r_dot_r_t / p_dot_Ap_t
+        alpha = float(alpha_t.item())
 
-        # 更新解: x = x + alpha * p
-        alpha_p = self.math_sim.vector_scale(alpha, self.p)
-        self.x = self.math_sim.vector_saxpy(alpha, self.p, self.x)
+        # x = x + alpha * p
+        x_t.add_(p_t, alpha=alpha)
 
-        # 更新残差: r = r - alpha * Ap
-        alpha_Ap = self.math_sim.vector_scale(alpha, self.Ap)
-        self.r = self.math_sim.vector_sub(self.r, alpha_Ap)
+        # r = r - alpha * Ap
+        r_t.add_(Ap_t, alpha=-alpha)
 
-        # 计算残差范数并记录
-        residual_norm = self.math_sim.vector_norm(self.r)
+        # residual_norm = ||r||
+        residual_norm = float(torch.linalg.vector_norm(r_t, ord=2).item())
         self.residual_tracker.record_residual(residual_norm)
 
-        # 检查收敛
-        converged = residual_norm/self.b_norm < self.stop_tol
+        converged = (residual_norm / self.b_norm) < self.stop_tol
 
-        # 计算 beta = (r^T r) / (old_r_dot_r)
-        old_r_dot_r = r_dot_r
-        new_r_dot_r = residual_norm ** 2
-        if old_r_dot_r > 1e-20:  # 使用更小的阈值
+        # beta = (r^T r) / old_r_dot_r
+        old_r_dot_r = float(r_dot_r_t.item())
+        new_r_dot_r = residual_norm**2
+        if old_r_dot_r > 1e-20:
             beta = new_r_dot_r / old_r_dot_r
-            # 防止beta过大
             if abs(beta) > 1e4:
                 beta = 1e4 * (1.0 if beta > 0 else -1.0)
         else:
             beta = 0.0
 
-        # 更新搜索方向: p = r + beta * p
-        beta_p = self.math_sim.vector_scale(beta, self.p)
-        self.p = self.math_sim.vector_add(self.r, beta_p)
+        # p = r + beta * p
+        p_t.mul_(beta).add_(r_t)
 
         # 重置 Ap 为下一次迭代
         self.Ap = None
 
         done = converged or (self.current_iteration >= self.max_iter - 1)
+
+        # torch 常驻：保持 torch
+        self.x = x_t
+        self.r = r_t
+        self.p = p_t
 
         return residual_norm, prev_residual_norm, converged, done, diverged
 

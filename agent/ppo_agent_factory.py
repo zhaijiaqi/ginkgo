@@ -12,6 +12,7 @@ from typing import Dict, Any, Optional, List
 import os
 import logging
 import time
+from collections import deque
 
 class CGPPOAgent:
     """
@@ -24,6 +25,11 @@ class CGPPOAgent:
         self.tile_state_dim = tile_state_dim
         self.action_size = action_size
         self.hidden_sizes = hidden_sizes if hidden_sizes is not None else [64, 64]  # 默认隐藏层大小
+        # 统计窗口：我们做 batch 推理时不走 pfrl.PPO.act()，因此需要自己维护 entropy/value 统计
+        # 用 deque 做滑动窗口，避免 get_statistics() 里出现空均值导致的 NaN
+        self._stats_window = int(ppo_kwargs.get("stats_window", 100))
+        self._entropy_window = deque(maxlen=self._stats_window)
+        self._value_window = deque(maxlen=self._stats_window)
 
         # 创建共享的模型（单个tile的状态维度）
         shared_model = self._create_single_tile_model(tile_state_dim, action_size, self.hidden_sizes)
@@ -116,63 +122,109 @@ class CGPPOAgent:
         model = pfrl.nn.Branched(policy_with_dist, value)
         return model
 
-    # def act(self, obs):
-    #     """为每个tile独立选择动作（参数共享的代理）- 优化批量推理"""
-    #     # 直接将连续的obs数组重塑为批量形式，避免切分/合并开销
-    #     obs_array = np.asarray(obs, dtype=np.float32)
-    #     batch_obs = obs_array.reshape(self.num_tiles, self.tile_state_dim)
-    #     batch_obs = torch.from_numpy(batch_obs)
-
-    #     # 使用共享模型进行推理（所有代理共享相同模型）
-    #     model = self.tile_agents[0].model
-    #     device = next(model.parameters()).device
-    #     batch_obs = batch_obs.to(device)
-
-    #     # 前向传播获取策略分布
-    #     with torch.no_grad():
-    #         policy_out, _ = model(batch_obs)
-    #         logits = policy_out.logits
-
-    #         # 添加数值稳定性检查
-    #         if torch.isnan(logits).any() or torch.isinf(logits).any():
-    #             print(f"警告: 检测到无效的logits值 - NaN: {torch.isnan(logits).any()}, Inf: {torch.isinf(logits).any()}")
-    #             print(f"logits范围: min={logits.min().item():.6f}, max={logits.max().item():.6f}")
-    #             # 使用均匀分布作为fallback
-    #             logits = torch.zeros_like(logits)
-
-    #         policy_out = torch.distributions.Categorical(logits=logits)
-
-    #         # policy_out 是批量分类分布，从中采样动作
-    #         actions = policy_out.sample().cpu().numpy()
-
-    #     # 为每个代理设置状态（模拟act方法的行为）
-    #     for tile_idx in range(self.num_tiles):
-    #         agent = self.tile_agents[tile_idx]
-
-    #         # 初始化batch变量（如果还没有初始化）
-    #         if agent.batch_last_episode is None:
-    #             agent._initialize_batch_variables(1)
-
-    #         # 设置上一次的状态和动作（模拟pfrl act方法的行为）
-    #         # 从原始obs中提取对应tile的观测
-    #         start_idx = tile_idx * self.tile_state_dim
-    #         end_idx = start_idx + self.tile_state_dim
-    #         tile_obs = obs[start_idx:end_idx]
-    #         agent.batch_last_state = [tile_obs]
-    #         agent.batch_last_action = [actions[tile_idx]]
-
-    #     return actions.tolist()  # 转换为列表以保持接口一致性
-    
     def act(self, obs):
-        """为每个tile独立选择动作（参数共享的代理）- 优化推理"""
-        actions = []
+        """为每个tile独立选择动作（参数共享的代理）- 优化批量推理"""
+        # 直接将连续的obs数组重塑为批量形式，避免切分/合并开销
+        obs_array = np.asarray(obs, dtype=np.float32)
+        batch_obs = obs_array.reshape(self.num_tiles, self.tile_state_dim)
+        batch_obs = torch.from_numpy(batch_obs)
+
+        # 使用共享模型进行推理（所有代理共享相同模型）
+        model = self.tile_agents[0].model
+        device = next(model.parameters()).device
+        batch_obs = batch_obs.to(device)
+
+        # 前向传播获取策略分布与 value（用于统计）
+        with torch.no_grad():
+            policy_dist, values = model(batch_obs)
+
+            # 数值稳定性：如果分布参数出现 NaN/Inf，fallback 到均匀分布
+            # 注意：policy_dist 通常已经是 torch.distributions.Distribution（来自 SoftmaxCategoricalHead）
+            if hasattr(policy_dist, "logits"):
+                logits = policy_dist.logits
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    print(
+                        f"警告: 检测到无效的logits值 - NaN: {torch.isnan(logits).any()}, Inf: {torch.isinf(logits).any()}"
+                    )
+                    print(f"logits范围: min={logits.min().item():.6f}, max={logits.max().item():.6f}")
+                    policy_dist = torch.distributions.Categorical(logits=torch.zeros_like(logits))
+            elif hasattr(policy_dist, "probs"):
+                probs = policy_dist.probs
+                if torch.isnan(probs).any() or torch.isinf(probs).any():
+                    print(
+                        f"警告: 检测到无效的probs值 - NaN: {torch.isnan(probs).any()}, Inf: {torch.isinf(probs).any()}"
+                    )
+                    # 用均匀 probs 作为 fallback
+                    uniform = torch.ones_like(probs) / probs.size(-1)
+                    policy_dist = torch.distributions.Categorical(probs=uniform)
+
+            # 从分布采样动作
+            actions_t = policy_dist.sample()
+
+            # 维护统计：batch 平均 entropy / value（不依赖 pfrl PPO 内部统计）
+            try:
+                ent = policy_dist.entropy()
+                self._entropy_window.append(float(ent.mean().detach().cpu().item()))
+            except Exception:
+                # 某些分布可能不支持 entropy（理论上不该发生），保持窗口不更新
+                pass
+
+            try:
+                # values 形状通常为 (B, 1) 或 (B,)
+                v = values
+                if v is not None:
+                    self._value_window.append(float(v.mean().detach().cpu().item()))
+            except Exception:
+                pass
+
+            actions = actions_t.detach().cpu().numpy()
+
+        # 为每个代理设置状态（模拟act方法的行为）
         for tile_idx in range(self.num_tiles):
+            agent = self.tile_agents[tile_idx]
+
+            # 初始化batch变量（如果还没有初始化）
+            if agent.batch_last_episode is None:
+                agent._initialize_batch_variables(1)
+
+            # 设置上一次的状态和动作（模拟pfrl act方法的行为）
+            # 从原始obs中提取对应tile的观测
             start_idx = tile_idx * self.tile_state_dim
             end_idx = start_idx + self.tile_state_dim
             tile_obs = obs[start_idx:end_idx]
-            action = self.tile_agents[tile_idx].act(tile_obs)
-            actions.append(action)
-        return actions
+            agent.batch_last_state = [tile_obs]
+            agent.batch_last_action = [actions[tile_idx]]
+
+        return actions.tolist()  # 转换为列表以保持接口一致性
+
+    def get_statistics(self):
+        """返回自定义统计信息（用于 batch act 的情况）"""
+        avg_value = float(np.mean(self._value_window)) if len(self._value_window) > 0 else np.nan
+        avg_entropy = float(np.mean(self._entropy_window)) if len(self._entropy_window) > 0 else np.nan
+        # 保持 pfrl 的接口风格：list[tuple[str, scalar]]
+        return [
+            ("average_value", np.float32(avg_value)),
+            ("average_entropy", np.float32(avg_entropy)),
+        ]
+
+    def _get_custom_stats_dict(self) -> Dict[str, np.float32]:
+        """以 dict 形式返回 batch 统计，便于与 PPO 原生统计合并。"""
+        stats = self.get_statistics()
+        out: Dict[str, np.float32] = {}
+        for k, v in stats:
+            out[k] = v
+        return out
+    
+    # def act(self, obs):
+    #     """为每个tile独立选择动作（参数共享的代理）- 优化推理"""
+    #     actions = []
+    #     for tile_idx in range(self.num_tiles):
+    #         start_idx = tile_idx * self.tile_state_dim
+    #         end_idx = start_idx + self.tile_state_dim
+    #         tile_obs = obs[start_idx:end_idx]
+    #         action = self.tile_agents[tile_idx].act(tile_obs)
+    #         actions.append(action)
+    #     return actions
 
     def observe(self, obs, reward, done, reset):
         """观察多tile环境的转换（参数共享的代理）"""
@@ -348,6 +400,14 @@ class PfrlCompatibleCGPPOAgent:
         self.cg_ppo_agent = cg_ppo_agent
         self.logger = logging.getLogger(__name__)
 
+    def _unwrap_cg_agent(self):
+        """
+        训练脚本里经常会传入 DoublePrecisionWrapperAgent，它的 .ppo_agent 才是 CGPPOAgent。
+        为了拿到 batch act 维护的 entropy/value 统计，这里统一做一次 unwrap。
+        """
+        inner = getattr(self.cg_ppo_agent, "ppo_agent", None)
+        return inner if inner is not None else self.cg_ppo_agent
+
     def act(self, obs):
         """选择动作"""
         return self.cg_ppo_agent.act(obs)
@@ -381,22 +441,62 @@ class PfrlCompatibleCGPPOAgent:
 
     def get_statistics(self):
         """获取统计信息"""
-        # 获取第一个代理的统计信息（所有代理共享相同模型）
+        # 目标：日志里既要有 PPO 原生的 loss/n_updates/explained_variance，
+        # 也要保证 average_value/average_entropy 在 batch act 场景下不为 NaN。
+        base_agent = self._unwrap_cg_agent()
+        custom = {}
         try:
-            stats = self.cg_ppo_agent.tile_agents[0].get_statistics()
-            # pfrl 返回的是列表，转换为字典
-            if isinstance(stats, list):
+            custom = base_agent._get_custom_stats_dict()
+        except Exception:
+            custom = {}
+
+        try:
+            # PPO 原生统计来自底层 tile_agents（无论是否 wrapper，都应能取到）
+            tile_agents = getattr(base_agent, "tile_agents", None)
+            if not tile_agents:
+                tile_agents = getattr(self.cg_ppo_agent, "tile_agents", None)
+            base_stats = tile_agents[0].get_statistics()
+
+            # pfrl PPO 通常返回 list[tuple[str, scalar]]；我们按原顺序输出，
+            # 但若遇到 average_value/average_entropy 就用 batch 统计覆盖。
+            if isinstance(base_stats, list):
+                merged_list = []
+                for k, v in base_stats:
+                    if k in custom:
+                        merged_list.append((k, custom[k]))
+                    else:
+                        merged_list.append((k, v))
+
+                # 如果 base 里缺少这两项（极少见），补到最前面以匹配你期望的日志格式
+                base_keys = {k for k, _ in merged_list}
+                for wanted in ("average_value", "average_entropy"):
+                    if wanted in custom and wanted not in base_keys:
+                        merged_list.insert(0 if wanted == "average_value" else 1, (wanted, custom[wanted]))
+
                 merged_stats = {}
-                for j, stat in enumerate(stats):
+                for j, stat in enumerate(merged_list):
                     merged_stats[f"shared_stat_{j}"] = stat
                 return merged_stats
-            elif isinstance(stats, dict):
-                return stats
-            else:
-                return {"shared_stats": stats}
+
+            # 如果 PPO 返回 dict（不常见），直接覆盖并返回
+            if isinstance(base_stats, dict):
+                merged = dict(base_stats)
+                merged.update(custom)
+                return merged
+
+            # 其他类型兜底
+            return {"shared_stats": base_stats, **custom}
         except Exception as e:
+            # 最后兜底：只返回 batch 自己的统计，至少不 NaN
             self.logger.warning(f"无法获取共享代理的统计信息: {e}")
-            return {}
+            merged_stats = {}
+            try:
+                stats = base_agent.get_statistics()
+                for j, stat in enumerate(stats):
+                    merged_stats[f"shared_stat_{j}"] = stat
+            except Exception:
+                pass
+            return merged_stats
 
     def eval_mode(self):
         """切换到评估模式，返回上下文管理器"""
