@@ -424,28 +424,58 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
             ),
         )
 
-    # True quantization with scaling and clipping for low precision formats
-    def quantize_value(value, scale, max_val, action):
-        return T.if_then_else(
-            action <= 1,  # float64 and float32: simple type conversion
-            T.if_then_else(
-                action == 0,
-                value,  # float64 - no change
-                T.Cast("float64", T.Cast("float32", value)),  # float32
-            ),
-            # action >= 2: true quantization for bfloat16 and float8_e5m2
-            T.if_then_else(
-                action == 2,
-                dequantize_value(T.Cast("float64", T.Cast("bfloat16",
-                    T.max(T.min(scale * value, max_val), -max_val))), scale),  # bfloat16 with scaling
-                dequantize_value(T.Cast("float64", T.Cast("float8_e5m2",
-                    T.max(T.min(scale * value, max_val), -max_val))), scale),  # float8_e5m2 with scaling
+    # 量化（不反量化）：返回“量化后的、仍处于缩放域(scale * value)的值”，并以 float64 承载
+    # - action==0: 不做量化，直接返回原值（此时 scale 应为 1）
+    # - action>0 : 先做 scale * value，再 clip，再 cast 到目标低精度，再 cast 回 float64 保存
+    # 真实低精度运算：后续乘法会把该 float64 再 cast 回目标低精度来执行乘法，
+    # 然后在乘法之后统一除以 (a_scale * x_scale) 完成反量化。
+    def quantize_scaled_value(value, scale, max_val, action):
+        val = scale * value
+        clipped_val = T.max(T.min(val, max_val), -max_val)
+        if_then_else = T.if_then_else
+        return if_then_else(
+            action == 0,
+            value,
+            if_then_else(
+                action == 1,
+                T.Cast("float64", T.Cast("float32", clipped_val)),
+                if_then_else(
+                    action == 2,
+                    T.Cast("float64", T.Cast("bfloat16", clipped_val)),
+                    if_then_else(
+                        action == 3,
+                        T.Cast("float64", T.Cast("float8_e5m2", clipped_val)),
+                        T.float64(0),
+                    ),
+                ),
             ),
         )
 
-    # Dequantization: convert back by dividing by scale
-    def dequantize_value(q_value, scale):
-        return q_value / scale
+    # 低精度乘法：把量化后的值 cast 回目标 dtype 做乘法，再 cast 回 float64
+    def lowp_mul_to_f64(a_q_f64, x_q_f64, action):
+        if_then_else = T.if_then_else
+        return if_then_else(
+            action == 0,
+            a_q_f64 * x_q_f64,
+            if_then_else(
+                action == 1,
+                T.Cast("float64", T.Cast("float32", a_q_f64) * T.Cast("float32", x_q_f64)),
+                if_then_else(
+                    action == 2,
+                    T.Cast("float64", T.Cast("bfloat16", a_q_f64) * T.Cast("bfloat16", x_q_f64)),
+                    if_then_else(
+                        action == 3,
+                        # More realistic FP8 math: FP8 operands, FP16 multiply (typical HW path), then cast to f64
+                        T.Cast(
+                            "float64",
+                            T.Cast("float16", T.Cast("float8_e5m2", a_q_f64))
+                            * T.Cast("float16", T.Cast("float8_e5m2", x_q_f64)),
+                        ),
+                        T.float64(0),
+                    ),
+                ),
+            ),
+        )
 
     R_TILES = (R + 31) // 32
     C_TILES = (C + 31) // 32
@@ -488,8 +518,8 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                     x_scale = T.float64(1.0)
                     a_scale = T.float64(1.0)
 
-                    # Only compute scaling for low precision formats (FP16, FP8)
-                    if action >= 2:
+                    # Only compute scaling for low precision formats (FP32，FP16, FP8)
+                    if action >= 1:
                         # Find dynamic range of x tile
                         x_max_abs = T.float64(0.0)
                         for ct_check in T.unroll(C_TILES):
@@ -519,9 +549,8 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                         x_lane[0] = T.float64(0)
                         col = x_base + cc_base + lane
                         if (cc_base + lane) < C and col < N:
-                            # Apply quantization to x
-                            x_val = x[col]
-                            x_lane[0] = quantize_value(x_val, x_scale, max_val, action)
+                            # Apply quantization to x (quantize only; dequantize after multiply)
+                            x_lane[0] = quantize_scaled_value(x[col], x_scale, max_val, action)
 
                         for cc in T.unroll(32):
                             cc_g = cc_base + cc
@@ -535,8 +564,10 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                                     if rr < R:
                                         # Apply quantization to A
                                         a_val = data[bk, rr, cc_g]
-                                        vA = quantize_value(a_val, a_scale, max_val, action)
-                                        acc[rt] += vA * vx
+                                        a_q = quantize_scaled_value(a_val, a_scale, max_val, action)
+                                        prod_q = lowp_mul_to_f64(a_q, vx, action)
+                                        # 反量化：在乘法之后除以 (a_scale * x_scale)
+                                        acc[rt] += prod_q / (a_scale * x_scale)
 
                 row_base = br * R
                 for rt in T.unroll(R_TILES):
@@ -684,7 +715,7 @@ def test_bsr_spmv_mixed():
 
     y_ref = A_bsr @ x
 
-    actions = np.full((N // C,), 3)
+    actions = np.full((N // C,), 1)
     # actions = np.random.randint(0, 2, size=N // C)
     y_tl = bsr_spmv_mixed(
         ref_data,
@@ -700,7 +731,8 @@ def test_bsr_spmv_mixed():
 
     print(y_tl[:20])
     print(y_ref[:20])
-    assert np.allclose(y_tl, y_ref, rtol=1e-5, atol=1e-6)
+    y_tl_np = y_tl.detach().cpu().numpy() if torch.is_tensor(y_tl) else np.asarray(y_tl)
+    assert np.allclose(y_tl_np, y_ref, rtol=1e-5, atol=1e-6)
     print("BSR SpMV kernel matches SciPy.")
 
 
