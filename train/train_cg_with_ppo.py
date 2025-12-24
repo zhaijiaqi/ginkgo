@@ -54,7 +54,7 @@ def create_env_config(config: Dict) -> Dict:
         'matrix_set_csv': config.get('cg', {}).get('matrix_set_csv', 'matrix_set.csv'),
         'tilesize': config.get('spmv', {}).get('tilesize', 32),
         'precision_cost_table': config.get('spmv', {}).get('precision_cost_table', {
-            'fp64': 1.0, 'fp32': 0.5, 'fp16': 0.25, 'fp8': 0.125
+            'fp64': 1.0, 'fp32': 0.5, 'bf16': 0.25
         }),
         'reward': config.get('reward'),
         'normalize_state': config.get('env', {}).get('normalize_state', True),

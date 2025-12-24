@@ -142,15 +142,25 @@ class CGEnvironment:
             'cache_misses': 0
         }
         
-        self.precision_cost_table = self.config.get('precision_cost_table', {
+        # 精度成本表（仅保留 fp64/fp32/bf16；bf16 成本与旧 fp16 一致）
+        raw_cost = self.config.get('precision_cost_table', {
             'fp64': 1.0,
             'fp32': 0.5,
-            'fp16': 0.25,
-            'fp8': 0.125
+            'bf16': 0.25,
         })
+        # 兼容旧配置：若还提供 fp16/fp8，则迁移到 bf16 并丢弃多余精度
+        if 'bf16' not in raw_cost and 'fp16' in raw_cost:
+            raw_cost = dict(raw_cost)
+            raw_cost['bf16'] = raw_cost.get('fp16', 0.25)
+        # 强制只保留三种
+        self.precision_cost_table = {
+            'fp64': float(raw_cost.get('fp64', 1.0)),
+            'fp32': float(raw_cost.get('fp32', 0.5)),
+            'bf16': float(raw_cost.get('bf16', 0.25)),
+        }
 
-        # 动作空间：6 种精度选择
-        self.action_space_n = len(self.precision_cost_table.keys())
+        # 动作空间：3 种精度选择（0=fp64, 1=fp32, 2=bf16）
+        self.action_space_n = 3
       
         # 重置环境
         self.reset()
@@ -484,7 +494,7 @@ class CGEnvironment:
         将动作转换为精度名称
 
         Args:
-            action: 精度动作 (0-5)
+            action: 精度动作 (0-2)
 
         Returns:
             精度名称字符串
@@ -495,12 +505,11 @@ class CGEnvironment:
         precision_map = {
             0: 'fp64',
             1: 'fp32',
-            2: 'fp16',
-            3: 'fp8'
+            2: 'bf16',
         }
 
         if action not in precision_map:
-            raise ValueError(f"无效的精度动作: {action}，必须在 0-5 范围内")
+            raise ValueError(f"无效的精度动作: {action}，必须在 0-2 范围内")
 
         return precision_map[action]
     
@@ -644,7 +653,7 @@ class CGEnvironment:
         执行一步：为当前迭代的所有 tiles 选择精度，完成一次完整的 CG 迭代
 
         Args:
-            actions: 精度选择动作列表，每个元素对应一个 tile 的精度 (0-5)
+            actions: 精度选择动作列表，每个元素对应一个 tile 的精度 (0-2)
 
         Returns:
             (next_state, reward, done, info)
@@ -762,8 +771,7 @@ class CGEnvironment:
                 precisions_to_test = [
                     ('fp64', 0),
                     ('fp32', 1),
-                    ('fp16', 2),
-                    ('fp8', 3)
+                    ('bf16', 2),
                 ]
                 precision_code_to_name = {code: name for name, code in precisions_to_test}
                 precision_counts = Counter(int(a) for a in actions)

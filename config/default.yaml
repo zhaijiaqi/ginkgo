@@ -11,8 +11,8 @@ spmv:
   precision_cost_table:
     fp64: 1.0
     fp32: 0.5
-    fp16: 0.25
-    fp8: 0.125
+    # bf16 成本与旧 fp16 保持一致
+    bf16: 0.25
 
 reward:
   type: weighted

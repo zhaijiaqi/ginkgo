@@ -38,8 +38,7 @@ def create_env_config(config: Dict, matrix_name: Optional[str] = None,
         'matrix_set_csv': config.get('cg', {}).get('matrix_set_csv', 'matrix_set.csv'),
         'tilesize': config.get('spmv', {}).get('tilesize', 32),
         'precision_cost_table': config.get('spmv', {}).get('precision_cost_table', {
-            'fp64': 1.0, 'fp32': 0.7, 'tf32': 0.55,
-            'fp16': 0.35, 'bf16': 0.33, 'fp8': 0.15
+            'fp64': 1.0, 'fp32': 0.5, 'bf16': 0.25
         }),
         'reward': config.get('reward'),
         'normalize_state': config.get('env', {}).get('normalize_state', True),

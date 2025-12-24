@@ -20,8 +20,7 @@ class Precision(Enum):
     """支持的精度类型"""
     FP64 = 0
     FP32 = 1
-    FP16 = 2
-    FP8 = 3
+    BF16 = 2
 
 
 class SparseMatrix:
@@ -112,8 +111,8 @@ class PrecisionConverter:
     PRECISION_SPECS = {
         'fp64': {'exponent': 11, 'mantissa': 52, 'bias': 1023},
         'fp32': {'exponent': 8, 'mantissa': 23, 'bias': 127},
-        'fp16': {'exponent': 5, 'mantissa': 10, 'bias': 15},
-        'fp8': {'exponent': 4, 'mantissa': 3, 'bias': 7},     # FP8 E4M3
+        # bf16：与 fp32 同 exponent，不同 mantissa
+        'bf16': {'exponent': 8, 'mantissa': 7, 'bias': 127},
     }
 
     @staticmethod
@@ -177,12 +176,20 @@ class SpMVBlockSimulator:
         self.tilesize = config.get('tilesize', 32)
 
         # 精度成本表 (相对 fp64 的成本)
-        self.precision_cost_table = config.get('precision_cost_table', {
+        raw_cost = config.get('precision_cost_table', {
             'fp64': 1.0,
             'fp32': 0.5,
-            'fp16': 0.25,
-            'fp8': 0.125
+            'bf16': 0.25,
         })
+        # 兼容旧配置：fp16 -> bf16（成本保持一致），丢弃 fp8
+        if 'bf16' not in raw_cost and 'fp16' in raw_cost:
+            raw_cost = dict(raw_cost)
+            raw_cost['bf16'] = raw_cost.get('fp16', 0.25)
+        self.precision_cost_table = {
+            'fp64': float(raw_cost.get('fp64', 1.0)),
+            'fp32': float(raw_cost.get('fp32', 0.5)),
+            'bf16': float(raw_cost.get('bf16', 0.25)),
+        }
 
         # 随机数种子，用于重现性
         self.random_seed = config.get('random_seed', 42)
@@ -225,7 +232,7 @@ class SpMVBlockSimulator:
         将动作转换为精度名称
 
         Args:
-            action: 精度动作 (0-5)
+            action: 精度动作 (0-2)
 
         Returns:
             精度名称字符串
@@ -236,12 +243,11 @@ class SpMVBlockSimulator:
         precision_map = {
             0: 'fp64',
             1: 'fp32',
-            2: 'fp16',
-            3: 'fp8'
+            2: 'bf16',
         }
 
         if action not in precision_map:
-            raise ValueError(f"无效的精度动作: {action}，必须在 0-5 范围内")
+            raise ValueError(f"无效的精度动作: {action}，必须在 0-2 范围内")
 
         return precision_map[action]
 
@@ -290,7 +296,7 @@ class SpMVBlockSimulator:
         Args:
             matrix_block: 该tile的矩阵块
             full_vector: 完整的输入向量
-            precision_action: 精度选择动作 (0-5)
+            precision_action: 精度选择动作 (0-2)
             accumulation_precision: 累加使用的精度
 
         Returns:
@@ -475,12 +481,11 @@ def validate_spmv_accuracy(matrix_size: int = 1024):
     exact_norm = np.linalg.norm(exact_result)
     print(f"精确结果 L2 范数: {exact_norm:.6f}")
 
-    # 测试不同精度
+    # 测试不同精度（与环境 action 定义保持一致：0=fp64, 1=fp32, 2=bf16）
     precisions_to_test = [
         ('fp64', 0),
         ('fp32', 1),
-        ('fp16', 2),
-        ('fp8', 3)
+        ('bf16', 2),
     ]
 
     results_summary = []
@@ -534,9 +539,9 @@ def validate_spmv_accuracy(matrix_size: int = 1024):
 
     # 检查成本计算
     fp64_cost = next(r for r in results_summary if r['precision'] == 'fp64')['cost']
-    fp8_cost = next(r for r in results_summary if r['precision'] == 'fp8')['cost']
-    if fp8_cost >= fp64_cost:
-        print(f"⚠️ 警告: fp8 成本 ({fp8_cost:.3f}) 不应该高于 fp64 成本 ({fp64_cost:.3f})")
+    bf16_cost = next(r for r in results_summary if r['precision'] == 'bf16')['cost']
+    if bf16_cost >= fp64_cost:
+        print(f"⚠️ 警告: bf16 成本 ({bf16_cost:.3f}) 不应该高于 fp64 成本 ({fp64_cost:.3f})")
     else:
         print("✓ 成本计算验证通过")
 

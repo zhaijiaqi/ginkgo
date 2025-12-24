@@ -340,11 +340,8 @@ def make_bsr_spmv_mixed_kernel(n_block_rows, nnzb, R, C, N):
                     T.if_then_else(
                         action == 1,
                         T.int32(23),
-                        T.if_then_else(
-                            action == 2,
-                            T.int32(10),
-                            T.int32(7),
-                        ),
+                        # action == 2: bf16 (mantissa=7)
+                        T.int32(7),
                     ),
                 )
 
@@ -373,7 +370,7 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
 
     BSR representation:
       data   : (nnzb, R, C) float64
-      actions: (N / C,) int32          # Precision level each block-column (0=float64, 1=float32, 2=float16, 3=float8)
+      actions: (N / C,) int32          # Precision level each block-column (0=fp64, 1=fp32, 2=bf16)
       indices: (nnzb,) int32           # block-column indices
       indptr : (n_block_rows+1,) int32 # row pointer on block-rows
 
@@ -386,23 +383,21 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
       - Dynamic range analysis: find max(|x|) and max(|A|) for each tile
       - Scaling: scale = max_representable_value / max_abs
       - Quantization: scale -> clip -> convert to target precision -> dequantize (divide by scale)
-      - action == 0: float64 (no quantization)
-      - action == 1: float32 precision with quantization
-      - action == 2: float16 precision with quantization
-      - action == 3: float8_e4m3 precision with quantization
+      - action == 0: fp64 (no quantization)
+      - action == 1: fp32 precision with quantization
+      - action == 2: bf16 precision with quantization
     """
 
     def q(v, action):
         v_f32 = T.Cast("float64", T.Cast("float32", v))
-        v_f16 = T.Cast("float64", T.Cast("float16", v))
-        v_fp8 = T.Cast("float64", T.Cast("float8_e4m3", v))
+        v_bf16 = T.Cast("float64", T.Cast("bfloat16", v))
         return T.if_then_else(
             action == 0,
             v,
             T.if_then_else(
                 action == 1,
                 v_f32,
-                T.if_then_else(action == 2, v_f16, v_fp8),
+                v_bf16,
             ),
         )
 
@@ -416,11 +411,8 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
             T.if_then_else(
                 action == 1,  # float32
                 T.float64(3.4e38),
-                T.if_then_else(
-                    action == 2,  # bfloat16
-                    T.float64(3.4e38),  # bfloat16 max
-                    T.float64(57344.0),    # float8_e5m2 max
-                ),
+                # action == 2: bfloat16
+                T.float64(3.4e38),  # bfloat16 max
             ),
         )
 
@@ -442,11 +434,7 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                 if_then_else(
                     action == 2,
                     T.Cast("float64", T.Cast("bfloat16", clipped_val)),
-                    if_then_else(
-                        action == 3,
-                        T.Cast("float64", T.Cast("float8_e5m2", clipped_val)),
-                        T.float64(0),
-                    ),
+                    T.float64(0),
                 ),
             ),
         )
@@ -463,16 +451,7 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                 if_then_else(
                     action == 2,
                     T.Cast("float64", T.Cast("bfloat16", a_q_f64) * T.Cast("bfloat16", x_q_f64)),
-                    if_then_else(
-                        action == 3,
-                        # More realistic FP8 math: FP8 operands, FP16 multiply (typical HW path), then cast to f64
-                        T.Cast(
-                            "float64",
-                            T.Cast("float16", T.Cast("float8_e5m2", a_q_f64))
-                            * T.Cast("float16", T.Cast("float8_e5m2", x_q_f64)),
-                        ),
-                        T.float64(0),
-                    ),
+                    T.float64(0),
                 ),
             ),
         )
@@ -518,7 +497,7 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                     x_scale = T.float64(1.0)
                     a_scale = T.float64(1.0)
 
-                    # Only compute scaling for low precision formats (FP32，FP16, FP8)
+                    # Only compute scaling for low precision formats (fp32, bf16)
                     if action >= 1:
                         # Find dynamic range of x tile
                         x_max_abs = T.float64(0.0)
@@ -599,6 +578,17 @@ def bsr_spmv_mixed(
     """
     # 允许直接传入 torch.Tensor（避免每次 numpy->torch / H2D / D2H）
     dev = torch.device(device)
+
+    # actions 仅支持 0(fp64)/1(fp32)/2(bf16)
+    if torch.is_tensor(actions):
+        a_min = int(actions.min().item()) if actions.numel() > 0 else 0
+        a_max = int(actions.max().item()) if actions.numel() > 0 else 0
+    else:
+        actions_np = np.asarray(actions, dtype=np.int32)
+        a_min = int(actions_np.min()) if actions_np.size > 0 else 0
+        a_max = int(actions_np.max()) if actions_np.size > 0 else 0
+    if a_min < 0 or a_max > 2:
+        raise ValueError(f"Invalid actions range [{a_min}, {a_max}]. Supported: 0(fp64), 1(fp32), 2(bf16).")
 
     if torch.is_tensor(data_bsr):
         data_t = data_bsr.to(device=dev, dtype=torch.float64)
@@ -759,7 +749,8 @@ def bench_bsr_spmv_mixed():
     ref_indptr = A_bsr.indptr
 
     x = np.random.randn(N).astype(np.float64)
-    actions = np.full((N // C,), 3, dtype=np.int32)
+    # action: 0=fp64, 1=fp32, 2=bf16
+    actions = np.full((N // C,), 2, dtype=np.int32)
     n_block_rows = ref_indptr.shape[0] - 1
     nnzb = ref_data.shape[0]
 
