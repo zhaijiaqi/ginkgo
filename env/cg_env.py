@@ -4,7 +4,7 @@ CG Environment - PPO-Guided Mixed-Precision CG 求解环境
 """
 
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, TYPE_CHECKING
 import math
 import random
 import csv
@@ -18,8 +18,34 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from simulator.cg_math_simulator import CGResidualTracker
 from simulator.spmv_block_simulator import SpMVBlockSimulator, SparseMatrix
 
-from kernels.spmv_kernels import bsr_spmv_mixed
+from kernels.spmv_kernels import bsr_spmv_mixed, bsr_spmv_mixed_prequant
 from kernels.coo2bsr_kernels import coo2bsr
+from kernels.fused_cg_kernel import fused_cg_step
+
+# Optional: BCSC + pre-quantization utilities (new path for future kernel refactor)
+if TYPE_CHECKING:
+    from kernels.bcsc_prequant import BCSCMatrix as _BCSCMatrix
+else:
+    _BCSCMatrix = Any  # runtime fallback
+
+try:
+    from kernels.bcsc_prequant import (
+        build_bcsc_from_coo,
+        quantize_bcsc_tiles,
+        spmv_bcsc_mixed_ref_prequant,
+    )
+
+    BCSC_AVAILABLE = True
+except Exception:
+    BCSC_AVAILABLE = False
+
+try:
+    # Optional: TileLang BCSC kernel (CUDA)
+    from kernels.bcsc_spmv_kernels import bcsc_spmv_mixed_prequant
+
+    BCSC_TL_AVAILABLE = True
+except Exception:
+    BCSC_TL_AVAILABLE = False
 
 
 try:
@@ -72,12 +98,35 @@ class CGEnvironment:
         self.torch_device = str(config.get('torch_device', 'cuda' if torch.cuda.is_available() else 'cpu'))
         self.torch_dtype = torch.float64
 
+        # BCSC + pre-quantization (optional)
+        self.use_bcsc_prequant = bool(config.get('use_bcsc_prequant', False))
+        # Where to store BCSC tensors. Default: same as torch_device (so later kernels can reuse).
+        self.bcsc_device = str(config.get('bcsc_device', self.torch_device))
+        # Use TensorCore path for bf16 actions (TileLang MMA). Default off.
+        self.bcsc_use_tensorcore = bool(config.get('bcsc_use_tensorcore', False))
+        # Optional self-check after building BCSC (can be expensive on huge matrices)
+        self.bcsc_self_check = bool(config.get('bcsc_self_check', False))
+        # SpMV implementation:
+        # - "bsr": current TileLang BSR kernel (default; runtime A+X quant as in existing kernel)
+        # - "bsr_prequant": TileLang BSR kernel using pre-quantized A tiles + per-tile a_scale (x still quantized online)
+        # - "bcsc_ref": BCSC reference SpMV (debug/correctness; slower, but no TileLang dependency)
+        # - "bcsc_prequant": TileLang BCSC kernel using pre-quantized A tiles (requires CUDA)
+        self.spmv_impl = str(config.get('spmv_impl', 'bcsc_prequant'))
+
+        # BSR A-tile pre-quantization (optional; keeps BSR format but moves A scaling to preprocessing)
+        self.use_bsr_prequant = bool(config.get('use_bsr_prequant', False))
+        self.bsr_prequant_device = str(config.get('bsr_prequant_device', self.torch_device))
+
         # 初始化模拟器
         spmv_config = {
             'tilesize': config.get('tilesize', 32),
-            'precision_cost_table': config.get('precision_cost_table'),
-            'random_seed': config.get('random_seed', 42)
+            'random_seed': config.get('random_seed', 42),
         }
+        # Only forward precision_cost_table if user provided a real dict.
+        # Passing None breaks SpMVBlockSimulator's expectations.
+        pct = config.get('precision_cost_table', None)
+        if isinstance(pct, dict):
+            spmv_config['precision_cost_table'] = pct
         self.spmv_sim = SpMVBlockSimulator(spmv_config)
         self.residual_tracker = CGResidualTracker()
 
@@ -118,6 +167,15 @@ class CGEnvironment:
         self.bsr_data_t = None
         self.bsr_indices_t = None
         self.bsr_indptr_t = None
+
+        # Optional: BSR pre-quant buffers (same tile order as bsr_data)
+        self.bsr_fp32_q_t = None
+        self.bsr_a_scale_fp32_t = None
+        self.bsr_bf16_q_t = None
+        self.bsr_a_scale_bf16_t = None
+
+        # BCSC (column-compressed blocks) + pre-quantized tiles
+        self.bcsc: Optional[_BCSCMatrix] = None
         
         # fp64 基准时间测量
         self.fp64_baseline_time = None  # fp64 计算 Ap 的基准时间（毫秒）
@@ -260,6 +318,12 @@ class CGEnvironment:
                 self.bsr_data, self.bsr_indices, self.bsr_indptr, self.bsr_R, self.bsr_C = self._convert_matrix_to_bsr()
                 self._maybe_cache_bsr_torch()
 
+                # Optional: build BCSC + pre-quantize A tiles
+                self._maybe_build_bcsc_prequant()
+
+                # Optional: build BSR pre-quant buffers
+                self._maybe_build_bsr_prequant()
+
                 self.matrix_loaded = True
                 self.b_cpu = b  # 将 b 缓存为 CPU numpy，便于下次复用
                 self.b = b
@@ -305,9 +369,88 @@ class CGEnvironment:
         self.bsr_data, self.bsr_indices, self.bsr_indptr, self.bsr_R, self.bsr_C = self._convert_matrix_to_bsr()
         self._maybe_cache_bsr_torch()
 
+        # Optional: build BCSC + pre-quantize A tiles
+        self._maybe_build_bcsc_prequant()
+
+        # Optional: build BSR pre-quant buffers
+        self._maybe_build_bsr_prequant()
+
         self.matrix_loaded = True
         self.b_cpu = b
         return A_diagonal, b
+
+    def _maybe_build_bcsc_prequant(self):
+        """
+        Build BCSC representation (column-compressed blocks) and pre-quantize A tiles.
+
+        This is a preprocessing step meant to be reused by future BCSC-based TileLang kernels.
+        It does NOT change the current SpMV path (still uses BSR kernel in step()).
+        """
+        self.bcsc = None
+        if not self.use_bcsc_prequant:
+            return
+        if not BCSC_AVAILABLE:
+            raise RuntimeError(
+                "use_bcsc_prequant=True but kernels.bcsc_prequant import failed. "
+                "Please ensure dependencies (torch) are available."
+            )
+        if self.A_sparse is None:
+            raise RuntimeError("矩阵未加载或转换失败 (A_sparse is None)")
+
+        tilesize = int(self.spmv_sim.tilesize)
+        dev = torch.device(self.bcsc_device)
+
+        # Build from our internal COO (SparseMatrix)
+        row = np.asarray(self.A_sparse.row_indices, dtype=np.int64)
+        col = np.asarray(self.A_sparse.col_indices, dtype=np.int64)
+        val = np.asarray(self.A_sparse.values, dtype=np.float64)
+        shape = (int(self.A_sparse.rows), int(self.A_sparse.cols))
+
+        bcsc = build_bcsc_from_coo(row, col, val, shape, tilesize=tilesize, device=dev)
+        bcsc = quantize_bcsc_tiles(bcsc)
+        # If we intend to run the TileLang BCSC kernel, ensure payloads are on CUDA once.
+        if self.spmv_impl == "bcsc_prequant":
+            if not torch.cuda.is_available():
+                raise RuntimeError("spmv_impl=bcsc_prequant requires CUDA, but torch.cuda.is_available() is False.")
+            bcsc = bcsc.to("cuda")
+        self.bcsc = bcsc
+
+        if self.verbose:
+            print(
+                f"[BCSC] built: n_br={bcsc.n_br} n_bc={bcsc.n_bc} nnzb={bcsc.nnzb} device={self.bcsc_device}"
+            )
+
+        if self.bcsc_self_check:
+            self._bcsc_self_check()
+
+    def _bcsc_self_check(self, *, seed: int = 0):
+        """
+        Optional correctness sanity check for BCSC reference SpMV (actions all-0).
+
+        This is mainly for development/debugging and can be slow for very large matrices.
+        """
+        if self.bcsc is None:
+            return
+        bcsc = self.bcsc
+        rng = np.random.default_rng(seed)
+        x_np = rng.standard_normal((bcsc.N,), dtype=np.float64)
+        x_t = torch.as_tensor(x_np, dtype=torch.float64, device=bcsc.A_fp64.device)
+        actions0 = torch.zeros((bcsc.n_bc,), dtype=torch.int32, device=bcsc.A_fp64.device)
+        y_bcsc = spmv_bcsc_mixed_ref_prequant(bcsc, actions0, x_t).detach().cpu().numpy()
+
+        # Compare with scipy dense-ish reference when available; otherwise fall back to COO sum (slow).
+        if self.A_matrix is not None and SCIPY_AVAILABLE:
+            y_ref = (self.A_matrix @ x_np).astype(np.float64)
+        else:
+            # COO reference
+            y_ref = np.zeros((bcsc.M,), dtype=np.float64)
+            y_ref[self.A_sparse.row_indices] += self.A_sparse.values * x_np[self.A_sparse.col_indices]
+
+        max_abs = float(np.max(np.abs(y_bcsc - y_ref))) if y_ref.size > 0 else 0.0
+        if not np.allclose(y_bcsc, y_ref, atol=1e-9, rtol=1e-9):
+            raise AssertionError(f"BCSC self-check failed: max_abs_diff={max_abs:.3e}")
+        if self.verbose:
+            print(f"[BCSC] self-check passed (actions=all0), max_abs_diff={max_abs:.3e}")
 
     def _maybe_cache_bsr_torch(self):
         """
@@ -325,6 +468,53 @@ class CGEnvironment:
         self.bsr_data_t = torch.as_tensor(np.asarray(self.bsr_data, dtype=np.float64), device=dev, dtype=torch.float64)
         self.bsr_indices_t = torch.as_tensor(np.asarray(self.bsr_indices, dtype=np.int32), device=dev, dtype=torch.int32)
         self.bsr_indptr_t = torch.as_tensor(np.asarray(self.bsr_indptr, dtype=np.int32), device=dev, dtype=torch.int32)
+
+    def _maybe_build_bsr_prequant(self):
+        """
+        Pre-quantize BSR tiles (A only) in preprocessing stage.
+
+        This keeps the existing BSR structure (indices/indptr), but stores:
+          - bsr_fp32_q_t + bsr_a_scale_fp32_t
+          - bsr_bf16_q_t + bsr_a_scale_bf16_t
+
+        so SpMV can skip per-tile A dynamic range scanning at runtime.
+        """
+        # reset (avoid stale buffers if matrix changes)
+        self.bsr_fp32_q_t = None
+        self.bsr_a_scale_fp32_t = None
+        self.bsr_bf16_q_t = None
+        self.bsr_a_scale_bf16_t = None
+
+        if not self.use_bsr_prequant:
+            return
+        if self.bsr_data_t is None:
+            # Ensure BSR is cached as torch first
+            self._maybe_cache_bsr_torch()
+        if self.bsr_data_t is None:
+            raise RuntimeError("use_bsr_prequant=True but bsr_data_t is None")
+
+        dev = torch.device(self.bsr_prequant_device)
+        A = self.bsr_data_t.to(device=dev, dtype=torch.float64)
+
+        # Match kernel constants
+        qmax = torch.tensor(1.8405e19, dtype=torch.float64, device=dev)
+        eps = torch.tensor(1e-12, dtype=torch.float64, device=dev)
+
+        a_max_abs = torch.amax(torch.abs(A), dim=(1, 2))  # [nnzb]
+        a_scale = qmax / (a_max_abs + eps)  # [nnzb]
+
+        A_scaled = A * a_scale[:, None, None]
+        A_clipped = torch.clamp(A_scaled, min=-qmax.item(), max=qmax.item())
+
+        self.bsr_fp32_q_t = A_clipped.to(torch.float32)
+        self.bsr_a_scale_fp32_t = a_scale.to(torch.float64)
+        self.bsr_bf16_q_t = A_clipped.to(torch.bfloat16)
+        self.bsr_a_scale_bf16_t = a_scale.to(torch.float64)
+
+        if self.verbose:
+            print(
+                f"[BSR-PREQUANT] built: nnzb={int(A.shape[0])} R={self.bsr_R} C={self.bsr_C} device={self.bsr_prequant_device}"
+            )
 
     def _csr_to_sparse_matrix(self, csr_mat) -> SparseMatrix:
         """
@@ -667,8 +857,19 @@ class CGEnvironment:
         num_tiles = (self.matrix_size + tilesize - 1) // tilesize  # 向上取整计算 tile 数量
 
         # 验证 actions 的长度
-        if len(actions) != num_tiles:
-            raise ValueError(f"actions 长度 {len(actions)} 与 tile 数量 {num_tiles} 不匹配")
+        # For BCSC implementations, actions are per block-column (n_bc), not per row-block (num_tiles)
+        # For square matrices, num_tiles == n_bc, but we need to handle the mismatch
+        if self.spmv_impl in ("bcsc_ref", "bcsc_prequant"):
+            if self.bcsc is not None:
+                expected_len = self.bcsc.n_bc
+                if len(actions) != expected_len:
+                    raise ValueError(
+                        f"BCSC actions 长度 {len(actions)} 与 block-column 数量 {expected_len} 不匹配 "
+                        f"(num_tiles={num_tiles}, n_bc={expected_len})"
+                    )
+        else:
+            if len(actions) != num_tiles:
+                raise ValueError(f"actions 长度 {len(actions)} 与 tile 数量 {num_tiles} 不匹配")
 
         # 记录当前迭代的所有 tile 动作
         self.tile_actions = actions.copy()
@@ -678,25 +879,109 @@ class CGEnvironment:
 
         spmv_start_time = time.time()
 
-        # 使用 TileLang BSR SpMV kernel 进行混合精度计算
-        if self.bsr_data is None:
-            raise RuntimeError("BSR 数据未初始化")
-
         dev = torch.device(self.torch_device)
         actions_t = torch.as_tensor(actions, dtype=torch.int32, device=dev)
-        self.Ap = bsr_spmv_mixed(
-            self.bsr_data_t if self.bsr_data_t is not None else self.bsr_data,
-            actions_t,
-            self.bsr_indices_t if self.bsr_indices_t is not None else self.bsr_indices,
-            self.bsr_indptr_t if self.bsr_indptr_t is not None else self.bsr_indptr,
-            self.p,
-            self.bsr_R,
-            self.bsr_C,
-            device=self.torch_device,
-            return_torch=True,
-        )
+        if self.spmv_impl == "bcsc_ref":
+            # print("-----------use bcsc_ref----------")
+            if self.bcsc is None:
+                # Try build on-demand (in case matrix loaded before flags changed)
+                self._maybe_build_bcsc_prequant()
+            if self.bcsc is None:
+                raise RuntimeError("spmv_impl=bcsc_ref requires BCSC prequant data, but bcsc is None.")
+
+            # Ensure tensors on same device as BCSC
+            bcsc_dev = self.bcsc.A_fp64.device
+            actions_bc = actions_t.to(device=bcsc_dev)
+            p_bc = self.p.to(device=bcsc_dev)
+            try:
+                self.Ap = spmv_bcsc_mixed_ref_prequant(self.bcsc, actions_bc, p_bc, trim_to_M=False)
+                if self.Ap is None:
+                    raise RuntimeError("spmv_bcsc_mixed_ref_prequant returned None")
+                # Move Ap back to torch_device to match self.p, self.r, self.x
+                if self.Ap.device != dev:
+                    self.Ap = self.Ap.to(device=dev)
+            except Exception as e:
+                raise RuntimeError(f"spmv_bcsc_mixed_ref_prequant failed: {e}") from e
+        elif self.spmv_impl == "bcsc_prequant":
+            # print("-----------use bcsc_prequant----------")
+            if not self.use_bcsc_prequant:
+                # Allow selecting spmv_impl without pre-building buffers (build on-demand)
+                self.use_bcsc_prequant = True
+                self._maybe_build_bcsc_prequant()
+            if self.bcsc is None:
+                raise RuntimeError("spmv_impl=bcsc_prequant requires BCSC prequant data, but bcsc is None.")
+            if not BCSC_TL_AVAILABLE:
+                raise RuntimeError(
+                    "spmv_impl=bcsc_prequant requires kernels.bcsc_spmv_kernels (TileLang CUDA) but import failed."
+                )
+            if not torch.cuda.is_available():
+                raise RuntimeError("spmv_impl=bcsc_prequant requires CUDA, but torch.cuda.is_available() is False.")
+
+            # Run on CUDA; keep BCSC on CUDA persistently (avoid per-step H2D copies).
+            if self.bcsc.A_fp64.device.type != "cuda":
+                self.bcsc = self.bcsc.to("cuda")
+            actions_bc = actions_t.to(device="cuda")
+            p_bc = self.p.to(device="cuda")
+            self.Ap = bcsc_spmv_mixed_prequant(
+                self.bcsc,
+                actions_bc,
+                p_bc,
+                device="cuda",
+                use_tensorcore_bf16=self.bcsc_use_tensorcore,
+                return_torch=True,
+            )
+            # Move Ap back to torch_device to match self.p, self.r, self.x
+            if self.Ap.device != dev:
+                self.Ap = self.Ap.to(device=dev)
+        elif self.spmv_impl == "bsr_prequant":
+            # print("-----------use bsr_prequant----------")
+            if not self.use_bsr_prequant:
+                # Allow selecting spmv_impl without pre-building buffers (build on-demand)
+                self.use_bsr_prequant = True
+                self._maybe_build_bsr_prequant()
+            if (
+                self.bsr_fp32_q_t is None
+                or self.bsr_a_scale_fp32_t is None
+                or self.bsr_bf16_q_t is None
+                or self.bsr_a_scale_bf16_t is None
+            ):
+                raise RuntimeError("spmv_impl=bsr_prequant requires pre-quant BSR buffers, but they are missing.")
+            self.Ap = bsr_spmv_mixed_prequant(
+                self.bsr_data_t if self.bsr_data_t is not None else self.bsr_data,
+                self.bsr_fp32_q_t,
+                self.bsr_a_scale_fp32_t,
+                self.bsr_bf16_q_t,
+                self.bsr_a_scale_bf16_t,
+                actions_t,
+                self.bsr_indices_t if self.bsr_indices_t is not None else self.bsr_indices,
+                self.bsr_indptr_t if self.bsr_indptr_t is not None else self.bsr_indptr,
+                self.p,
+                self.bsr_R,
+                self.bsr_C,
+                device=self.torch_device,
+                return_torch=True,
+            )
+        else:
+            # print("-----------use bsr----------")
+            # Default: use TileLang BSR SpMV kernel
+            if self.bsr_data is None:
+                raise RuntimeError("BSR 数据未初始化")
+            self.Ap = bsr_spmv_mixed(
+                self.bsr_data_t if self.bsr_data_t is not None else self.bsr_data,
+                actions_t,
+                self.bsr_indices_t if self.bsr_indices_t is not None else self.bsr_indices,
+                self.bsr_indptr_t if self.bsr_indptr_t is not None else self.bsr_indptr,
+                self.p,
+                self.bsr_R,
+                self.bsr_C,
+                device=self.torch_device,
+                return_torch=True,
+            )
+        if self.Ap is None:
+            raise RuntimeError(f"SpMV implementation '{self.spmv_impl}' did not set self.Ap (still None after execution)")
         if int(self.Ap.shape[0]) > self.matrix_size:
             self.Ap = self.Ap[: self.matrix_size]
+        ap_shape = tuple(int(x) for x in self.Ap.shape)
 
         # 计算每个 tile 的计算成本，并累加得到迭代总成本
         iteration_cpt_cost = 0.0
@@ -819,6 +1104,8 @@ class CGEnvironment:
             'converged': converged,
             'residual_norm': residual_norm,
             'residual_norm_relative': residual_norm/self.b_norm,
+            'spmv_impl': self.spmv_impl,
+            'Ap_shape': ap_shape,
             'performance_stats': self.performance_stats.copy()
         }
 
@@ -831,7 +1118,7 @@ class CGEnvironment:
 
     def _complete_cg_iteration(self) -> Tuple[float, float, bool, bool, bool]:
         """
-        完成一次完整的 CG 迭代（PyTorch 版本，保证与原实现数值路径一致）
+        完成一次完整的 CG 迭代（使用融合内核版本）
 
         Returns:
             (residual_norm, prev_residual_norm, converged, done, diverged)
@@ -847,13 +1134,27 @@ class CGEnvironment:
         # prev_residual_norm = ||r||
         prev_residual_norm = float(torch.linalg.vector_norm(r_t, ord=2).item())
 
-        # r_dot_r / p_dot_Ap
-        r_dot_r_t = torch.dot(r_t, r_t)
-        p_dot_Ap_t = torch.dot(p_t, Ap_t)
-        p_dot_Ap = float(p_dot_Ap_t.item())
+        # 使用融合内核完成 CG 迭代步骤
+        # fused_cg_step 会修改 r, p, x 的值，并返回 stats: [||r||², ||r_new||², aj]
+        # 其中 mu 对应 Ap
+        if not torch.cuda.is_available():
+            raise RuntimeError("融合 CG 内核需要 CUDA，但 CUDA 不可用")
+        
+        # 确保所有 tensor 都在 CUDA 上
+        if r_t.device.type != "cuda":
+            raise RuntimeError(f"融合 CG 内核需要 tensor 在 CUDA 上，但 r 在 {r_t.device} 上")
+        
+        device = str(r_t.device)
+        stats = fused_cg_step(r_t, Ap_t, p_t, x_t, device=device, block_size=256)
+        
+        # 提取统计信息
+        r_dot_r_old = float(stats[0].item())  # ||r||² (旧)
+        r_dot_r_new = float(stats[1].item())  # ||r_new||² (新)
+        aj = float(stats[2].item())  # alpha (aj)
+        
+        # 检查发散：如果 aj == 0，说明 p_dot_Ap <= 1e-307（fused kernel 在分母过小时返回 0.0）
         diverged = False
-
-        if p_dot_Ap <= 1e-307:
+        if abs(aj) < 1e-300:  # 接近 0，表示分母过小（fused kernel 返回 0.0 当 p_dot_Ap <= 1e-307）
             print("⚠️  WARNING: Ap is not orthogonal to p or numerical instability detected. The algorithm has diverged.")
             diverged = True
             done = True
@@ -861,40 +1162,18 @@ class CGEnvironment:
             current_residual_norm = prev_residual_norm
             return current_residual_norm, prev_residual_norm, converged, done, diverged
 
-        alpha_t = r_dot_r_t / p_dot_Ap_t
-        alpha = float(alpha_t.item())
-
-        # x = x + alpha * p
-        x_t.add_(p_t, alpha=alpha)
-
-        # r = r - alpha * Ap
-        r_t.add_(Ap_t, alpha=-alpha)
-
-        # residual_norm = ||r||
-        residual_norm = float(torch.linalg.vector_norm(r_t, ord=2).item())
+        # residual_norm = ||r_new|| = sqrt(||r_new||²)
+        residual_norm = float(np.sqrt(r_dot_r_new))
         self.residual_tracker.record_residual(residual_norm)
 
         converged = (residual_norm / self.b_norm) < self.stop_tol
-
-        # beta = (r^T r) / old_r_dot_r
-        old_r_dot_r = float(r_dot_r_t.item())
-        new_r_dot_r = residual_norm**2
-        if old_r_dot_r > 1e-20:
-            beta = new_r_dot_r / old_r_dot_r
-            if abs(beta) > 1e4:
-                beta = 1e4 * (1.0 if beta > 0 else -1.0)
-        else:
-            beta = 0.0
-
-        # p = r + beta * p
-        p_t.mul_(beta).add_(r_t)
 
         # 重置 Ap 为下一次迭代
         self.Ap = None
 
         done = converged or (self.current_iteration >= self.max_iter - 1)
 
-        # torch 常驻：保持 torch
+        # torch 常驻：保持 torch（fused_cg_step 已经原地修改了 r, p, x）
         self.x = x_t
         self.r = r_t
         self.p = p_t

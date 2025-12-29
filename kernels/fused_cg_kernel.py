@@ -4,7 +4,7 @@ import tilelang
 import tilelang.language as T
 import torch
 from scipy.io import mmread
-from kernel_utils import benchmark_kernel
+from .kernel_utils import benchmark_kernel
 
 
 @tilelang.jit(target="cuda")
@@ -340,10 +340,7 @@ def fused_cg(
     residual_norms.append(residual_norm)
 
     b_norm = torch.norm(b).item()
-    if b_norm > 0:
-        converged = (residual_norm / b_norm) < tol
-    else:
-        converged = residual_norm < tol
+    converged = (residual_norm / b_norm) < tol
 
     if converged:
         return x, residual_norms, True
@@ -359,10 +356,7 @@ def fused_cg(
         residual_norm = stats[1].item() ** 0.5
         residual_norms.append(residual_norm)
 
-        if b_norm > 0:
-            converged = (residual_norm / b_norm) < tol
-        else:
-            converged = residual_norm < tol
+        converged = (residual_norm / b_norm) < tol
 
         if converged:
             return x, residual_norms, True

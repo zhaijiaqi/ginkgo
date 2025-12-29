@@ -402,18 +402,18 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
         )
 
 
-    # Max representable values for different precisions
-    def get_max_value(action):
-        # Return max representable value for different precisions
+    # Mul-safe quantization:
+    # We keep |a_q|,|x_q| <= qmax, where qmax ~= sqrt(max_finite_lowp),
+    # so lowp_mul(a_q, x_q) cannot overflow in fp32/bf16.
+    #
+    # sqrt(3.4e38) ~= 1.8439e19
+    # sqrt(bf16_max_finite) ~= 1.8405e19
+    # Use a single conservative constant for both.
+    def get_qmax(action):
         return T.if_then_else(
-            action == 0,  # float64 - use a large value
-            T.float64(1e37),
-            T.if_then_else(
-                action == 1,  # float32
-                T.float64(3.4e38),
-                # action == 2: bfloat16
-                T.float64(3.4e38),  # bfloat16 max
-            ),
+            action == 0,
+            T.float64(1.0),
+            T.float64(1.8405e19),
         )
 
     # 量化（不反量化）：返回“量化后的、仍处于缩放域(scale * value)的值”，并以 float64 承载
@@ -421,9 +421,9 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
     # - action>0 : 先做 scale * value，再 clip，再 cast 到目标低精度，再 cast 回 float64 保存
     # 真实低精度运算：后续乘法会把该 float64 再 cast 回目标低精度来执行乘法，
     # 然后在乘法之后统一除以 (a_scale * x_scale) 完成反量化。
-    def quantize_scaled_value(value, scale, max_val, action):
+    def quantize_scaled_value(value, scale, qmax, action):
         val = scale * value
-        clipped_val = T.max(T.min(val, max_val), -max_val)
+        clipped_val = T.max(T.min(val, qmax), -qmax)
         if_then_else = T.if_then_else
         return if_then_else(
             action == 0,
@@ -433,13 +433,26 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                 T.Cast("float64", T.Cast("float32", clipped_val)),
                 if_then_else(
                     action == 2,
-                    T.Cast("float64", T.Cast("bfloat16", clipped_val)),
+                    # Avoid bf16 overflow to inf on very large magnitudes: clamp to bf16 max finite
+                    # before casting. This aligns with the prequant path and keeps action=2 stable.
+                    T.Cast(
+                        "float64",
+                        T.Cast(
+                            "bfloat16",
+                            T.max(
+                                T.min(clipped_val, T.float64(1.8405e19)),
+                                -T.float64(1.8405e19),
+                            ),
+                        ),
+                    ),
                     T.float64(0),
                 ),
             ),
         )
 
     # 低精度乘法：把量化后的值 cast 回目标 dtype 做乘法，再 cast 回 float64
+    # With mul-safe quantization (|a_q|,|x_q| <= qmax ~= 1.8e19),
+    # fp32/bf16 multiply will not overflow. We can use true lowp multiply.
     def lowp_mul_to_f64(a_q_f64, x_q_f64, action):
         if_then_else = T.if_then_else
         return if_then_else(
@@ -492,8 +505,8 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                     action = actions[bc]
                     x_base = bc * C
 
-                    # Calculate quantization parameters for this tile (only for low precision)
-                    max_val = get_max_value(action)
+                    # Calculate mul-safe quantization parameters for this tile (only for low precision)
+                    qmax = get_qmax(action)
                     x_scale = T.float64(1.0)
                     a_scale = T.float64(1.0)
 
@@ -518,9 +531,9 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                                 a_val_check = data[bk, rr_check, cc_check]
                                 a_max_abs = T.max(a_max_abs, T.abs(a_val_check))
 
-                        # Calculate scaling factors: scale = max_representable / max_abs
-                        x_scale = max_val / (x_max_abs + T.float64(1e-12))
-                        a_scale = max_val / (a_max_abs + T.float64(1e-12))
+                        # Mul-safe scaling factors: scale = qmax / max_abs
+                        x_scale = qmax / (x_max_abs + T.float64(1e-12))
+                        a_scale = qmax / (a_max_abs + T.float64(1e-12))
 
                     for ct in T.unroll(C_TILES):
                         cc_base = ct * 32
@@ -529,7 +542,7 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                         col = x_base + cc_base + lane
                         if (cc_base + lane) < C and col < N:
                             # Apply quantization to x (quantize only; dequantize after multiply)
-                            x_lane[0] = quantize_scaled_value(x[col], x_scale, max_val, action)
+                            x_lane[0] = quantize_scaled_value(x[col], x_scale, qmax, action)
 
                         for cc in T.unroll(32):
                             cc_g = cc_base + cc
@@ -543,10 +556,202 @@ def make_bsr_spmv_mixed_kernel_warp_reduce(
                                     if rr < R:
                                         # Apply quantization to A
                                         a_val = data[bk, rr, cc_g]
-                                        a_q = quantize_scaled_value(a_val, a_scale, max_val, action)
+                                        a_q = quantize_scaled_value(a_val, a_scale, qmax, action)
                                         prod_q = lowp_mul_to_f64(a_q, vx, action)
                                         # 反量化：在乘法之后除以 (a_scale * x_scale)
                                         acc[rt] += prod_q / (a_scale * x_scale)
+
+                row_base = br * R
+                for rt in T.unroll(R_TILES):
+                    rr = rt * 32 + lane
+                    if rr < R:
+                        y[row_base + rr] = acc[rt]
+
+    return main
+
+
+@tilelang.jit(target="cuda")
+def make_bsr_spmv_mixed_prequant_kernel_warp_reduce(
+    n_block_rows, nnzb, R, C, N, WARPS_PER_BLOCK=2
+):
+    """
+    Build a y = A x quantized SpMV kernel for BSR format with PRE-QUANTIZED A tiles.
+
+    Compared to `make_bsr_spmv_mixed_kernel_warp_reduce`, this variant:
+      - keeps online quantization for x (vector tile) to compute x_scale and x_q
+      - uses precomputed (A_fp32_q, a_scale_fp32) or (A_bf16_q, a_scale_bf16) to avoid
+        scanning A tile range every SpMV call.
+
+    Inputs:
+      data_fp64     : (nnzb, R, C) float64
+      data_fp32_q   : (nnzb, R, C) float32    # stored in quantized domain (scale * A, clipped, cast)
+      a_scale_fp32  : (nnzb,)      float64
+      data_bf16_q   : (nnzb, R, C) bfloat16   # stored in quantized domain
+      a_scale_bf16  : (nnzb,)      float64
+      actions       : (N/C,) int32            # per block-column action (0=fp64, 1=fp32, 2=bf16)
+      indices       : (nnzb,) int32
+      indptr        : (n_block_rows+1,) int32
+      x             : (N,) float64
+      y             : (n_block_rows*R,) float64
+    """
+
+    # Mul-safe quantization constant (see online kernel).
+    def get_qmax(action):
+        return T.if_then_else(
+            action == 0,
+            T.float64(1.0),
+            T.float64(1.8405e19),
+        )
+
+    def quantize_scaled_value(value, scale, qmax, action):
+        val = scale * value
+        clipped_val = T.max(T.min(val, qmax), -qmax)
+        if_then_else = T.if_then_else
+        return if_then_else(
+            action == 0,
+            value,
+            if_then_else(
+                action == 1,
+                T.Cast("float64", T.Cast("float32", clipped_val)),
+                if_then_else(
+                    action == 2,
+                    # Avoid bf16 overflow to inf on very large magnitudes: clamp to bf16 max finite
+                    # before casting. This keeps action=2 numerically stable (finite).
+                    T.Cast(
+                        "float64",
+                        T.Cast(
+                            "bfloat16",
+                            T.max(
+                                T.min(clipped_val, T.float64(1.8405e19)),
+                                -T.float64(1.8405e19),
+                            ),
+                        ),
+                    ),
+                    T.float64(0),
+                ),
+            ),
+        )
+
+    # With mul-safe quantization, true lowp multiply is safe.
+    def lowp_mul_to_f64(a_q_f64, x_q_f64, action):
+        if_then_else = T.if_then_else
+        return if_then_else(
+            action == 0,
+            a_q_f64 * x_q_f64,
+            if_then_else(
+                action == 1,
+                T.Cast("float64", T.Cast("float32", a_q_f64) * T.Cast("float32", x_q_f64)),
+                if_then_else(
+                    action == 2,
+                    T.Cast("float64", T.Cast("bfloat16", a_q_f64) * T.Cast("bfloat16", x_q_f64)),
+                    T.float64(0),
+                ),
+            ),
+        )
+
+    R_TILES = (R + 31) // 32
+    C_TILES = (C + 31) // 32
+
+    @T.prim_func
+    def main(
+        data_fp64: T.Tensor((nnzb, R, C), "float64"),  # type: ignore
+        data_fp32_q: T.Tensor((nnzb, R, C), "float32"),  # type: ignore
+        a_scale_fp32: T.Tensor((nnzb,), "float64"),  # type: ignore
+        data_bf16_q: T.Tensor((nnzb, R, C), "bfloat16"),  # type: ignore
+        a_scale_bf16: T.Tensor((nnzb,), "float64"),  # type: ignore
+        actions: T.Tensor(((N + C - 1) // C,), "int32"),  # type: ignore
+        indices: T.Tensor((nnzb,), "int32"),  # type: ignore
+        indptr: T.Tensor((n_block_rows + 1,), "int32"),  # type: ignore
+        x: T.Tensor((N,), "float64"),  # type: ignore
+        y: T.Tensor((n_block_rows * R,), "float64"),  # type: ignore
+    ):
+        with T.Kernel(
+            T.ceildiv(n_block_rows, WARPS_PER_BLOCK), threads=32 * WARPS_PER_BLOCK
+        ) as bx:
+            warp = T.get_warp_idx_sync()
+            lane = T.get_lane_idx()
+            br = bx * WARPS_PER_BLOCK + warp
+
+            acc = T.alloc_local((R_TILES,), "float64")
+            for rt in T.unroll(R_TILES):
+                acc[rt] = T.float64(0)
+            x_lane = T.alloc_local((1,), "float64")
+            x_lane[0] = T.float64(0)
+            mask = T.tvm_warp_activemask()
+
+            if br < n_block_rows:
+                start = indptr[br]
+                end = indptr[br + 1]
+
+                for bk in T.serial(start, end):
+                    bc = indices[bk]
+                    action = actions[bc]
+                    x_base = bc * C
+
+                    qmax = get_qmax(action)
+                    x_scale = T.float64(1.0)
+
+                    # online x quantization only when low precision is selected
+                    if action >= 1:
+                        x_max_abs = T.float64(0.0)
+                        for ct_check in T.unroll(C_TILES):
+                            cc_base_check = ct_check * 32
+                            for cc_check in T.unroll(32):
+                                cc_g_check = cc_base_check + cc_check
+                                if cc_g_check < C:
+                                    col_check = x_base + cc_g_check
+                                    if col_check < N:
+                                        x_val_check = x[col_check]
+                                        x_max_abs = T.max(x_max_abs, T.abs(x_val_check))
+                        x_scale = qmax / (x_max_abs + T.float64(1e-12))
+
+                    # Select per-tile a_scale (only used for action>=1)
+                    a_scale = T.if_then_else(
+                        action == 1,
+                        a_scale_fp32[bk],
+                        T.if_then_else(action == 2, a_scale_bf16[bk], T.float64(1.0)),
+                    )
+
+                    for ct in T.unroll(C_TILES):
+                        cc_base = ct * 32
+
+                        x_lane[0] = T.float64(0)
+                        col = x_base + cc_base + lane
+                        if (cc_base + lane) < C and col < N:
+                            x_lane[0] = quantize_scaled_value(x[col], x_scale, qmax, action)
+
+                        for cc in T.unroll(32):
+                            cc_g = cc_base + cc
+                            if cc_g < C:
+                                vx = T.tvm_warp_shuffle(
+                                    mask, x_lane[0], T.int32(cc), 32, 32
+                                )
+
+                                for rt in T.unroll(R_TILES):
+                                    rr = rt * 32 + lane
+                                    if rr < R:
+                                        # Load A depending on action
+                                        a_q = T.if_then_else(
+                                            action == 0,
+                                            data_fp64[bk, rr, cc_g],
+                                            T.if_then_else(
+                                                action == 1,
+                                                T.Cast(
+                                                    "float64",
+                                                    data_fp32_q[bk, rr, cc_g],
+                                                ),
+                                                T.Cast(
+                                                    "float64",
+                                                    data_bf16_q[bk, rr, cc_g],
+                                                ),
+                                            ),
+                                        )
+                                        prod_q = lowp_mul_to_f64(a_q, vx, action)
+                                        acc[rt] += T.if_then_else(
+                                            action == 0,
+                                            prod_q,
+                                            prod_q / (a_scale * x_scale),
+                                        )
 
                 row_base = br * R
                 for rt in T.unroll(R_TILES):
@@ -643,6 +848,73 @@ def bsr_spmv_mixed(
         return y_t
 
     # Back to numpy
+    return y_t.cpu().numpy()
+
+
+def bsr_spmv_mixed_prequant(
+    data_fp64,
+    data_fp32_q,
+    a_scale_fp32,
+    data_bf16_q,
+    a_scale_bf16,
+    actions,
+    indices_bsr,
+    indptr_bsr,
+    x,
+    R,
+    C,
+    device="cuda",
+    return_torch: bool = True,
+):
+    """
+    BSR mixed SpMV with PRE-QUANTIZED A tiles.
+
+    This wrapper mirrors `bsr_spmv_mixed`, but consumes precomputed A quantization payloads
+    (two low-precision buffers + scales). x quantization is still performed online.
+    """
+    dev = torch.device(device)
+
+    # Normalize inputs to torch tensors on device
+    def _to_t(t, dtype):
+        if torch.is_tensor(t):
+            return t.to(device=dev, dtype=dtype)
+        return torch.as_tensor(t, device=dev, dtype=dtype)
+
+    data_fp64_t = _to_t(data_fp64, torch.float64)
+    data_fp32_q_t = _to_t(data_fp32_q, torch.float32)
+    a_scale_fp32_t = _to_t(a_scale_fp32, torch.float64)
+    data_bf16_q_t = _to_t(data_bf16_q, torch.bfloat16)
+    a_scale_bf16_t = _to_t(a_scale_bf16, torch.float64)
+
+    indptr_t = _to_t(indptr_bsr, torch.int32)
+    indices_t = _to_t(indices_bsr, torch.int32)
+    actions_t = _to_t(actions, torch.int32)
+    x_t = _to_t(x, torch.float64)
+
+    nnzb = int(data_fp64_t.shape[0])
+    n_block_rows = int(indptr_t.shape[0]) - 1
+    N = int(x_t.shape[0])
+
+    y_t = torch.zeros((n_block_rows * R,), dtype=torch.float64, device=dev)
+
+    spmv_kernel = make_bsr_spmv_mixed_prequant_kernel_warp_reduce(
+        n_block_rows, nnzb, R, C, N
+    )
+    spmv_kernel(
+        data_fp64_t,
+        data_fp32_q_t,
+        a_scale_fp32_t,
+        data_bf16_q_t,
+        a_scale_bf16_t,
+        actions_t,
+        indices_t,
+        indptr_t,
+        x_t,
+        y_t,
+    )
+
+    if return_torch:
+        return y_t
     return y_t.cpu().numpy()
 
 
