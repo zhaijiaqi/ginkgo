@@ -4,7 +4,7 @@ import tilelang
 import tilelang.language as T
 import torch
 from scipy.io import mmread
-from .kernel_utils import benchmark_kernel
+from kernel_utils import benchmark_kernel
 
 
 @tilelang.jit(target="cuda")
@@ -17,6 +17,7 @@ def make_fused_cg_step_kernel(
 ):
     """
     Fused kernel for CG iteration step: compute aj, update x and r, then compute βj and update p.
+    Also computes residual_norm and converged flag.
 
     This kernel performs:
     1. aj = (r·r) / (μ·p)  [dot_div]
@@ -24,17 +25,22 @@ def make_fused_cg_step_kernel(
     3. r_new = r - aj * μ  [axpy]
     4. βj = ||r_new||² / ||r||²
     5. p = r_new + βj * p  [axpy]
+    6. residual_norm = sqrt(||r_new||²)
+    7. prev_residual_norm = sqrt(||r||²)
+    8. converged = (residual_norm / b_norm) < stop_tol
 
     Inputs:
     - r: residual vector (N,)
     - mu: Ap vector (N,)
     - p: search direction (N,)
     - x: solution vector (N,) [in/out]
+    - b_norm: L2 norm of right-hand side vector (scalar)
+    - stop_tol: convergence tolerance (scalar)
     Outputs:
     - x: updated solution
     - r: updated residual (r_new)
     - p: updated search direction
-    - stats: [||r||², ||r_new||², aj] for convergence/debug
+    - stats: [||r||², ||r_new||², aj, residual_norm, converged]
     """
 
     @T.prim_func
@@ -43,7 +49,9 @@ def make_fused_cg_step_kernel(
         mu: T.Tensor((N,), dtype),          # type: ignore  # A*p vector
         p: T.Tensor((N,), dtype),           # type: ignore  # search direction [in/out]
         x: T.Tensor((N,), dtype),           # type: ignore  # solution vector [in/out]
-        stats: T.Tensor((3,), accum_dtype),  # type: ignore  # [||r||², ||r_new||², aj]
+        b_norm: T.Tensor((1,), accum_dtype),  # type: ignore  # L2 norm of b (scalar)
+        stop_tol: T.Tensor((1,), accum_dtype),  # type: ignore  # convergence tolerance (scalar)
+        stats: T.Tensor((5,), accum_dtype),  # type: ignore  # [||r||², ||r_new||², aj, residual_norm, converged]
     ):
         # NOTE:
         # The original version launched multiple CTAs (grid_size > 1) and only performed
@@ -119,25 +127,28 @@ def make_fused_cg_step_kernel(
                 T.sync_threads()
 
             # Warp-synchronous reduction
-            if block_size >= 64:
-                if tx < 32:
-                    smem_rr[tx] += smem_rr[tx + 32]
-                    smem_mu_p[tx] += smem_mu_p[tx + 32]
-            if tx < 16:
-                smem_rr[tx] += smem_rr[tx + 16]
-                smem_mu_p[tx] += smem_mu_p[tx + 16]
-            if tx < 8:
-                smem_rr[tx] += smem_rr[tx + 8]
-                smem_mu_p[tx] += smem_mu_p[tx + 8]
-            if tx < 4:
-                smem_rr[tx] += smem_rr[tx + 4]
-                smem_mu_p[tx] += smem_mu_p[tx + 4]
-            if tx < 2:
-                smem_rr[tx] += smem_rr[tx + 2]
-                smem_mu_p[tx] += smem_mu_p[tx + 2]
-            if tx < 1:
-                smem_rr[tx] += smem_rr[tx + 1]
-                smem_mu_p[tx] += smem_mu_p[tx + 1]
+            # if block_size >= 64:
+            #     if tx < 32:
+            #         smem_rr[tx] += smem_rr[tx + 32]
+            #         smem_mu_p[tx] += smem_mu_p[tx + 32]
+            # if tx < 16:
+            #     smem_rr[tx] += smem_rr[tx + 16]
+            #     smem_mu_p[tx] += smem_mu_p[tx + 16]
+            # if tx < 8:
+            #     smem_rr[tx] += smem_rr[tx + 8]
+            #     smem_mu_p[tx] += smem_mu_p[tx + 8]
+            # if tx < 4:
+            #     smem_rr[tx] += smem_rr[tx + 4]
+            #     smem_mu_p[tx] += smem_mu_p[tx + 4]
+            # if tx < 2:
+            #     smem_rr[tx] += smem_rr[tx + 2]
+            #     smem_mu_p[tx] += smem_mu_p[tx + 2]
+            # if tx < 1:
+            #     smem_rr[tx] += smem_rr[tx + 1]
+            #     smem_mu_p[tx] += smem_mu_p[tx + 1]
+                
+            T.warp_reduce_sum(smem_rr, 0)
+            T.warp_reduce_sum(smem_mu_p, 0)
 
             # Thread 0 computes aj and stores in shared memory
             if tx == 0:
@@ -151,12 +162,13 @@ def make_fused_cg_step_kernel(
                 # Compute aj = (r·r) / (μ·p), match `pytorch_cg`'s tiny-denom guard
                 # denom_ok = abs(mu_dot_p) > 1e-307
                 denom_ok = T.abs(mu_dot_p) > T.Cast(accum_dtype, 1e-307)
-                smem_scalars[0] = T.if_then_else(
+                aj = T.if_then_else(
                     denom_ok,
                     r_dot_r / mu_dot_p,
                     T.Cast(accum_dtype, 0.0),
                 )
-                stats[2] = smem_scalars[0]
+                smem_scalars[0] = aj
+                stats[2] = aj
 
             # Sync before vector operations
             T.sync_threads()
@@ -219,6 +231,22 @@ def make_fused_cg_step_kernel(
             if tx == 0:
                 r_new_norm_sq_val = smem_r_new_sq[0]
                 stats[1] = r_new_norm_sq_val
+                
+                # Compute residual_norm = sqrt(||r_new||²)
+                residual_norm = T.sqrt(r_new_norm_sq_val)
+                stats[3] = residual_norm
+                
+                # Compute converged = (residual_norm / b_norm) < stop_tol
+                b_norm_val = b_norm[0]
+                stop_tol_val = stop_tol[0]
+                relative_residual = residual_norm / b_norm_val
+                converged_val = T.if_then_else(
+                    relative_residual < stop_tol_val,
+                    T.Cast(accum_dtype, 1.0),
+                    T.Cast(accum_dtype, 0.0),
+                )
+                stats[4] = converged_val
+                
                 # βj = (r_new, r_new) / (r_old, r_old), match `pytorch_cg` guard:
                 # beta = where(abs(rj_dot_rj) > 1e-307, rj_dot_rj_new / rj_dot_rj, 0)
                 denom_ok_beta = T.abs(stats[0]) > T.Cast(accum_dtype, 1e-307)
@@ -243,6 +271,8 @@ def make_fused_cg_step_kernel(
 
 def fused_cg_step(
     r, mu, p, x,
+    b_norm,
+    stop_tol,
     device="cuda",
     *,
     block_size=64,
@@ -252,16 +282,38 @@ def fused_cg_step(
 
     Args:
         r, mu, p, x: torch.Tensor vectors (modified in-place)
+        b_norm: L2 norm of right-hand side vector (float or torch.Tensor scalar)
+        stop_tol: convergence tolerance (float or torch.Tensor scalar)
         device: target device
         block_size: CUDA block size
 
     Returns:
-        stats: [||r||², ||r_new||², aj]
+        stats: torch.Tensor of shape (5,) containing:
+            [0] ||r||² (old residual norm squared)
+            [1] ||r_new||² (new residual norm squared)
+            [2] aj (alpha)
+            [3] residual_norm (sqrt of ||r_new||²)
+            [4] converged (1.0 if converged, 0.0 otherwise)
     """
     N = r.shape[0]
     dtype = "float64"  # Assume float64 for now
 
-    stats = torch.zeros((3,), dtype=torch.float64, device=device)
+    stats = torch.zeros((5,), dtype=torch.float64, device=device)
+    
+    # Convert b_norm and stop_tol to torch tensors if needed
+    if not torch.is_tensor(b_norm):
+        b_norm_t = torch.tensor([float(b_norm)], dtype=torch.float64, device=device)
+    else:
+        b_norm_t = b_norm.to(device=device, dtype=torch.float64)
+        if b_norm_t.dim() == 0:
+            b_norm_t = b_norm_t.unsqueeze(0)
+    
+    if not torch.is_tensor(stop_tol):
+        stop_tol_t = torch.tensor([float(stop_tol)], dtype=torch.float64, device=device)
+    else:
+        stop_tol_t = stop_tol.to(device=device, dtype=torch.float64)
+        if stop_tol_t.dim() == 0:
+            stop_tol_t = stop_tol_t.unsqueeze(0)
 
     # Build and run kernel
     grid_size = (N + block_size - 1) // block_size
@@ -273,7 +325,7 @@ def fused_cg_step(
         block_size=block_size,
     )
 
-    fused_kernel(r, mu, p, x, stats)
+    fused_kernel(r, mu, p, x, b_norm_t, stop_tol_t, stats)
 
     return stats
 
@@ -350,16 +402,28 @@ def fused_cg(
         mu = A_func(p)
 
         # Fused CG step: compute aj, βj and update x, r, p in one kernel
-        stats = fused_cg_step(r, mu, p, x, device=device, block_size=block_size)
+        # Also computes residual_norm, converged, and diverged
+        stats = fused_cg_step(
+            r, mu, p, x,
+            b_norm=b_norm,
+            stop_tol=tol,
+            device=device,
+            block_size=block_size
+        )
 
-        # Extract residual norm
-        residual_norm = stats[1].item() ** 0.5
+        # Extract residual norm and converged flag from stats
+        # stats: [||r||², ||r_new||², aj, residual_norm, converged]
+        # Minimize sync overhead: batch the .item() calls together
+        # PyTorch also calls .item() every iteration, but we can optimize by checking flags first
+        residual_norm = stats[3].item()  # residual_norm (sqrt of ||r_new||²)
         residual_norms.append(residual_norm)
-
-        converged = (residual_norm / b_norm) < tol
+        
+        # Check convergence (this also requires sync, but we need it for correctness)
+        # Note: PyTorch version also syncs every iteration, so this is expected overhead
+        converged = bool(stats[4].item() > 0.5)  # converged flag
 
         if converged:
-            return x, residual_norms, True
+            return x, residual_norms, converged
 
     return x, residual_norms, False
 
@@ -467,8 +531,8 @@ def test_fused_cg():
     dev = torch.device("cuda")
 
     # Load matrix from file
-    print("Loading matrix from ~/data/matrix/bundle1.mtx...")
-    A_sparse = mmread('/home/bingxing2/home/scx7axu/data/matrix/bundle1.mtx')
+    print("Loading matrix from ~/data/matrix/bodyy4.mtx...")
+    A_sparse = mmread('/home/bingxing2/home/scx7axu/data/matrix/bodyy4.mtx')
     A_dense = torch.from_numpy(A_sparse.toarray()).to(dev, dtype=torch.float64)
     N = A_dense.shape[0]
     print(f"Matrix size: {N}x{N}, nnz: {A_sparse.nnz}")

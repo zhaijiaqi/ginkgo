@@ -5,11 +5,10 @@ Standard CSR format with tile-based quantization:
   rowptr : (M+1,) int32   # row pointer
   colind : (nnz,) int32   # column indices
   values : (nnz,) float64 # non-zero values
-  tile_map: (nnz,) int32  # tile index for each non-zero
 
 Tile-based quantization:
-  - actions: (n_br,) int32  # per block-row action (0=fp64, 1=fp32, 2=bf16)
-  - a_scale: (n_tiles,) float64  # per-tile scale
+  - actions: (n_bc,) int32  # per block-column action (0=fp64, 1=fp32, 2=bf16)
+  - a_scale: (n_br, n_bc) float64  # per-tile scale stored as 2D array, indexed by br = row // R, bc = col // C
 
 NOTE:
 CSR iterates rows. Each row is computed independently, so no atomic adds needed.
@@ -30,10 +29,10 @@ def make_csr_spmv_mixed_prequant_kernel_warp_reduce(
     M: int,
     N: int,
     nnz: int,
-    n_tiles: int,
+    n_br: int,
+    n_bc: int,
     R: int,
     C: int,
-    n_bc: int,
     WARPS_PER_BLOCK: int = 2,
 ):
     """
@@ -46,12 +45,12 @@ def make_csr_spmv_mixed_prequant_kernel_warp_reduce(
     Values:
       data_fp64    : (nnz,) float64   # action==0
       data_fp32_q  : (nnz,) float32   # action==1 (quantized-domain values)
-      a_scale_fp32 : (n_tiles,) float64
+      a_scale_fp32 : (n_br, n_bc) float64
       data_bf16_q  : (nnz,) bfloat16  # action==2 (quantized-domain values)
-      a_scale_bf16 : (n_tiles,) float64
+      a_scale_bf16 : (n_br, n_bc) float64
 
     Tile mapping:
-      tile_map : (nnz,) int32  # tile index for each non-zero
+      a_scale is stored as 2D array (n_br, n_bc), indexed by br = row // R, bc = col // C
 
     Vector:
       actions : (n_bc,) int32  # 0=fp64, 1=fp32, 2=bf16 (per block-column, n_bc = (N+C-1)//C)
@@ -120,13 +119,12 @@ def make_csr_spmv_mixed_prequant_kernel_warp_reduce(
     def main(
         data_fp64: T.Tensor((nnz,), "float64"),  # type: ignore
         data_fp32_q: T.Tensor((nnz,), "float32"),  # type: ignore
-        a_scale_fp32: T.Tensor((n_tiles,), "float64"),  # type: ignore
+        a_scale_fp32: T.Tensor((n_br, n_bc), "float64"),  # type: ignore
         data_bf16_q: T.Tensor((nnz,), "bfloat16"),  # type: ignore
-        a_scale_bf16: T.Tensor((n_tiles,), "float64"),  # type: ignore
+        a_scale_bf16: T.Tensor((n_br, n_bc), "float64"),  # type: ignore
         actions: T.Tensor((n_bc,), "int32"),  # type: ignore
         rowptr: T.Tensor((M + 1,), "int32"),  # type: ignore
         colind: T.Tensor((nnz,), "int32"),  # type: ignore
-        tile_map: T.Tensor((nnz,), "int32"),  # type: ignore
         x: T.Tensor((N,), "float64"),  # type: ignore
         y: T.Tensor((M,), "float64"),  # type: ignore
     ):
@@ -158,17 +156,21 @@ def make_csr_spmv_mixed_prequant_kernel_warp_reduce(
             if row < M:
                 start = rowptr[row]
                 end = rowptr[row + 1]
+                num_nnz = end - start
 
-                # Iterate non-zeros in this row
-                # For now, let's use a simpler approach: lane 0 processes all elements
-                # TODO: optimize with warp-level parallelism later
-                if lane == 0:
-                    for k in T.serial(start, end):
+                # OPTIMIZATION 1: Warp-level parallelism
+                # Distribute non-zeros across warp lanes (32 threads)
+                # Each thread processes elements at stride 32
+                for k_idx in T.serial((num_nnz + 31) // 32):
+                    k = start + k_idx * 32 + lane
+                    if k < end:
                         col_idx = colind[k]
-                        tile_idx = tile_map[k]
+                        
+                        # Calculate tile indices directly from row and col_idx
+                        br = row // R  # block-row index
+                        bc = col_idx // C  # block-column index
                         
                         # Get action for this column (per block-column)
-                        bc = col_idx // C  # block-column index
                         action = actions_smem[bc]  # Each column has its own action
 
                         # Compute qmax and x_scale for this specific action
@@ -182,8 +184,8 @@ def make_csr_spmv_mixed_prequant_kernel_warp_reduce(
                         # Select per-tile a_scale (each element may have different tile, so different a_scale)
                         a_scale = T.if_then_else(
                             action == 1,
-                            a_scale_fp32[tile_idx],
-                            T.if_then_else(action == 2, a_scale_bf16[tile_idx], T.float64(1.0)),
+                            a_scale_fp32[br, bc],
+                            T.if_then_else(action == 2, a_scale_bf16[br, bc], T.float64(1.0)),
                         )
                         inv_scale = T.if_then_else(
                             action == 0,
@@ -216,9 +218,33 @@ def make_csr_spmv_mixed_prequant_kernel_warp_reduce(
                             # col_idx >= N, skip
                             pass
                 
-                # Write result directly (no warp reduction needed for now)
+                # OPTIMIZATION 2: Warp reduction using shared memory
+                # Store each thread's accumulator to shared memory, then reduce
+                # This is safer and easier to understand than warp shuffle
+                warp_reduce_smem[warp, lane] = acc[0]
+                T.sync_threads()
+                
+                # Reduce in shared memory (only first warp in block does reduction)
+                # Each warp reduces its own values
+                if lane < 16:
+                    warp_reduce_smem[warp, lane] = warp_reduce_smem[warp, lane] + warp_reduce_smem[warp, lane + 16]
+                T.sync_threads()
+                if lane < 8:
+                    warp_reduce_smem[warp, lane] = warp_reduce_smem[warp, lane] + warp_reduce_smem[warp, lane + 8]
+                T.sync_threads()
+                if lane < 4:
+                    warp_reduce_smem[warp, lane] = warp_reduce_smem[warp, lane] + warp_reduce_smem[warp, lane + 4]
+                T.sync_threads()
+                if lane < 2:
+                    warp_reduce_smem[warp, lane] = warp_reduce_smem[warp, lane] + warp_reduce_smem[warp, lane + 2]
+                T.sync_threads()
+                if lane < 1:
+                    warp_reduce_smem[warp, lane] = warp_reduce_smem[warp, lane] + warp_reduce_smem[warp, lane + 1]
+                T.sync_threads()
+                
+                # Write result
                 if lane == 0:
-                    y[row] = acc[0]
+                    y[row] = warp_reduce_smem[warp, 0]
 
     return main
 
@@ -266,15 +292,16 @@ def csr_spmv_mixed_prequant(
 
     y_t = torch.zeros((int(csr_d.M),), dtype=torch.float64, device=dev)
 
+    n_br = (int(csr_d.M) + int(csr_d.R) - 1) // int(csr_d.R)
     n_bc = (int(csr_d.N) + int(csr_d.C) - 1) // int(csr_d.C)
     kernel = make_csr_spmv_mixed_prequant_kernel_warp_reduce(
         int(csr_d.M),
         int(csr_d.N),
         int(csr_d.nnz),
-        int(csr_d.n_tiles),
+        n_br,
+        n_bc,
         int(csr_d.R),
         int(csr_d.C),
-        n_bc,
     )
     kernel(
         csr_d.A_fp64,
@@ -285,7 +312,6 @@ def csr_spmv_mixed_prequant(
         actions_t,
         csr_d.rowptr,
         csr_d.colind,
-        csr_d.tile_map,
         x_t,
         y_t,
     )

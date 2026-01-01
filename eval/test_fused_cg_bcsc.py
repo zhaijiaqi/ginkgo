@@ -46,7 +46,7 @@ def solve_cg_with_fused_kernels(
     tol: float = 1e-10,
     actions: Optional[torch.Tensor] = None,
     device: str = "cuda",
-    block_size: int = 256,
+    block_size: int = 64,
     verbose: bool = True,
 ):
     """
@@ -130,30 +130,36 @@ def solve_cg_with_fused_kernels(
             Ap = Ap[:N]
         
         # 2. 使用 fused_cg_step 完成一次 CG 迭代
+        # 在调用 kernel 之前计算并保存当前的残差范数
+        prev_residual_norm = float(torch.linalg.vector_norm(r, ord=2).item())
+        
         time_fused_cg_start = time.time()
-        stats = fused_cg_step(r, Ap, p, x, device=device, block_size=block_size)
+        stats = fused_cg_step(
+            r, Ap, p, x,
+            b_norm=b_norm,
+            stop_tol=tol,
+            device=device,
+            block_size=block_size
+        )
         time_fused_cg_end = time.time()
         time_fused_cg += time_fused_cg_end - time_fused_cg_start
         
-        
-        # 提取统计信息
-        r_dot_r_old = float(stats[0].item())  # ||r||² (旧)
-        r_dot_r_new = float(stats[1].item())  # ||r_new||² (新)
+        # 从 kernel 返回的 stats 中提取所有信息
+        # stats: [||r||², ||r_new||², aj, residual_norm, converged]
+        residual_norm = float(stats[3].item())  # sqrt(||r_new||²)
         aj = float(stats[2].item())  # alpha (aj)
+        converged = bool(stats[4].item() > 0.5)  # converged flag
         
-        # 检查发散
-        if abs(aj) < 1e-300:
+        residual_norms.append(residual_norm)
+        
+        # 检查发散：如果 aj == 0，说明 p_dot_Ap <= 1e-307（fused kernel 在分母过小时返回 0.0）
+        if abs(aj) < 1e-300:  # 接近 0，表示分母过小
             if verbose:
                 print(f"⚠️  警告: 迭代 {iteration+1} 发散 (aj={aj:.3e})")
             break
         
-        # 计算当前残差范数
-        residual_norm = float(np.sqrt(r_dot_r_new))
-        residual_norms.append(residual_norm)
-        
-        # 检查收敛
+        # 计算相对残差（用于打印）
         relative_residual = residual_norm / b_norm
-        converged = relative_residual < tol
         
         if verbose and (iteration % 10 == 0 or converged):
             print(f"迭代 {iteration+1:4d}: 残差={residual_norm:.6e}, 相对残差={relative_residual:.6e}, aj={aj:.6e}")
@@ -243,7 +249,7 @@ def main():
     parser.add_argument(
         '--block_size',
         type=int,
-        default=256,
+        default=64,
         help='fused_cg_step 的 block size（默认: 256）'
     )
     
