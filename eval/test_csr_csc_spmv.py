@@ -16,6 +16,7 @@ from kernels.csr_prequant import build_csr_from_scipy, quantize_csr_matrix
 from kernels.csc_prequant import build_csc_from_scipy, quantize_csc_matrix
 from kernels.csr_spmv_kernels import csr_spmv_mixed_prequant
 from kernels.csc_spmv_kernels import csc_spmv_mixed_prequant
+from kernels.csc_spmv_kernels import make_csc_spmv_kernel
 from kernels.kernel_utils import benchmark_kernel
 
 
@@ -171,6 +172,62 @@ def test_csc_spmv(matrix_name=None, R=64, C=64):
     print("\n✓ CSC SpMV tests passed!")
 
 
+def test_csc_spmv_fp64_cuda_style(matrix_name=None):
+    """
+    Test pure-fp64 CSC SpMV kernel that matches the provided CUDA CSC_SpMV_kernel style:
+      - grid-stride over columns
+      - iterate nnz within each column
+      - atomicAdd into y[row]
+    """
+    print("\n" + "=" * 60)
+    print("Testing CSC fp64 (CUDA-style) kernel...")
+    print("=" * 60)
+
+    if matrix_name:
+        print(f"Loading matrix: {matrix_name}")
+        A_csr = load_matrix_from_mtx(matrix_name)
+        A_csc = A_csr.tocsc()
+        M, N = A_csc.shape
+        print(f"  Matrix size: {M} x {N}, nnz: {A_csc.nnz}")
+    else:
+        # Use random matrix for testing
+        M, N = 1024, 1024
+        density = 0.05
+        nnz = int(M * N * density)
+        rows, cols, vals, shape = random_coo(M, N, nnz, seed=0)
+        A_coo = coo_matrix((vals, (rows, cols)), shape=shape)
+        A_csc = A_coo.tocsc()
+        print(f"Using random matrix: {M} x {N}, nnz: {nnz}")
+
+    # Build CSC matrix (fp64 values only; no quantization needed)
+    csc = build_csc_from_scipy(A_csc, R=64, C=64, device="cuda")
+
+    # Generate random x
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal(int(csc.N)).astype(np.float64)
+    x_t = torch.as_tensor(x, dtype=torch.float64, device="cuda")
+
+    # Reference result
+    y_ref = A_csc @ x
+
+    # Build and run kernel (signature: colptr, rowind, values, x, y)
+    kernel = make_csc_spmv_kernel(
+        int(csc.M),
+        int(csc.N),
+        int(csc.nnz),
+    )
+    y_t = torch.zeros((int(csc.M),), dtype=torch.float64, device="cuda")
+    kernel(csc.colptr, csc.rowind, csc.A_fp64, x_t, y_t)
+    y_kernel = y_t.detach().cpu().numpy()
+
+    max_err = np.max(np.abs(y_kernel - y_ref))
+    rel_err = np.max(np.abs(y_kernel - y_ref) / (np.abs(y_ref) + 1e-12))
+    print(f"  Kernel vs scipy: max_err={max_err:.2e}, rel_err={rel_err:.2e}")
+    assert np.allclose(y_kernel, y_ref, rtol=1e-10, atol=1e-12), "fp64 CUDA-style CSC kernel vs scipy failed"
+
+    print("\n✓ CSC fp64 (CUDA-style) test passed!")
+
+
 def benchmark_csr_spmv(matrix_name=None, R=64, C=64):
     """Benchmark CSR SpMV kernel performance."""
     print("\n" + "=" * 60)
@@ -315,6 +372,56 @@ def benchmark_csc_spmv(matrix_name=None, R=64, C=64):
         benchmark_kernel(kernel, kernel_args, csc.nnz, warmup=1000, iters=10000)
 
 
+def benchmark_csc_spmv_fp64_cuda_style(matrix_name=None):
+    """
+    Benchmark pure-fp64 CSC SpMV kernel (CUDA-style):
+      - grid-stride over columns
+      - iterate nnz within each column
+      - atomicAdd into y[row]
+    """
+    print("\n" + "=" * 60)
+    print("Benchmarking CSC fp64 (CUDA-style) kernel...")
+    print("=" * 60)
+
+    if matrix_name:
+        print(f"Loading matrix: {matrix_name}")
+        A_csr = load_matrix_from_mtx(matrix_name)
+        A_csc = A_csr.tocsc()
+        M, N = A_csc.shape
+        print(f"  Matrix size: {M} x {N}, nnz: {A_csc.nnz}")
+    else:
+        # Use random matrix for benchmarking
+        M, N = 4096, 4096
+        density = 0.05
+        nnz = int(M * N * density)
+        rows, cols, vals, shape = random_coo(M, N, nnz, seed=0)
+        A_coo = coo_matrix((vals, (rows, cols)), shape=shape)
+        A_csc = A_coo.tocsc()
+        print(f"Using random matrix: {M} x {N}, nnz: {nnz}")
+
+    # Build CSC (fp64 only)
+    csc = build_csc_from_scipy(A_csc, R=64, C=64, device="cuda")
+
+    # Random x
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal(int(csc.N)).astype(np.float64)
+    x_t = torch.as_tensor(x, dtype=torch.float64, device="cuda")
+
+    # Build kernel (signature: colptr, rowind, values, x, y)
+    n_bc = (int(csc.N) + int(csc.C) - 1) // int(csc.C)
+    n_br = (int(csc.M) + int(csc.R) - 1) // int(csc.R)
+    kernel = make_csc_spmv_kernel(
+        int(csc.M),
+        int(csc.N),
+        int(csc.nnz),
+    )
+
+    y_t = torch.zeros((int(csc.M),), dtype=torch.float64, device="cuda")
+    kernel_args = (csc.colptr, csc.rowind, csc.A_fp64, x_t, y_t)
+
+    benchmark_kernel(kernel, kernel_args, csc.nnz, warmup=5, iters=10)
+
+
 def test_multiple_matrices(matrix_names=None, R=64, C=64):
     """Test and benchmark CSR and CSC SpMV on multiple real matrices."""
     if matrix_names is None:
@@ -372,17 +479,21 @@ if __name__ == "__main__":
         test_multiple_matrices(matrix_names=args.matrices, R=args.R, C=args.C)
     elif args.matrix_name:
         # Test single matrix
-        test_csr_spmv(matrix_name=args.matrix_name, R=args.R, C=args.C)
-        test_csc_spmv(matrix_name=args.matrix_name, R=args.R, C=args.C)
-        benchmark_csr_spmv(matrix_name=args.matrix_name, R=args.R, C=args.C)
-        benchmark_csc_spmv(matrix_name=args.matrix_name, R=args.R, C=args.C)
+        # test_csr_spmv(matrix_name=args.matrix_name, R=args.R, C=args.C)
+        # test_csc_spmv(matrix_name=args.matrix_name, R=args.R, C=args.C)
+        # test_csc_spmv_fp64_cuda_style(matrix_name=args.matrix_name)
+        # benchmark_csr_spmv(matrix_name=args.matrix_name, R=args.R, C=args.C)
+        # benchmark_csc_spmv(matrix_name=args.matrix_name, R=args.R, C=args.C)
+        benchmark_csc_spmv_fp64_cuda_style(matrix_name=args.matrix_name)
         
     else:
         # Default: test with random matrix
-        test_csr_spmv(R=args.R, C=args.C)
+        # test_csr_spmv(R=args.R, C=args.C)
         test_csc_spmv(R=args.R, C=args.C)
-        benchmark_csr_spmv(R=args.R, C=args.C)
+        test_csc_spmv_fp64_cuda_style()
+        # benchmark_csr_spmv(R=args.R, C=args.C)
         benchmark_csc_spmv(R=args.R, C=args.C)
+        benchmark_csc_spmv_fp64_cuda_style()
     
     print("\n" + "=" * 60)
     print("All tests completed!")

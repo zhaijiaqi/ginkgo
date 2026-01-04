@@ -37,6 +37,7 @@ def make_csc_spmv_mixed_prequant_kernel_warp_reduce(
     n_br: int,
     WARPS_PER_BLOCK: int = 16,
     THREADS_PER_WARP: int = 32,
+    NNZ_PER_WARP: int = 1024,
 ):
     """
     CSC mixed SpMV with PRE-QUANTIZED A values (tile-based).
@@ -79,43 +80,9 @@ def make_csc_spmv_mixed_prequant_kernel_warp_reduce(
         clipped_val = T.max(T.min(val, qmax), -qmax)
         if_then_else = T.if_then_else
         return if_then_else(
-            action == 0,
-            value,
-            if_then_else(
-                action == 1,
-                T.Cast("float64", T.Cast("float32", clipped_val)),
-                if_then_else(
-                    action == 2,
-                    T.Cast(
-                        "float64",
-                        T.Cast(
-                            "bfloat16",
-                            T.max(
-                                T.min(clipped_val, T.float64(1.8405e19)),
-                                -T.float64(1.8405e19),
-                            ),
-                        ),
-                    ),
-                    T.float64(0),
-                ),
-            ),
-        )
-
-    # With mul-safe quantization, true lowp multiply is safe.
-    def lowp_mul_to_f64(a_q_f64, x_q_f64, action):
-        if_then_else = T.if_then_else
-        return if_then_else(
-            action == 0,
-            a_q_f64 * x_q_f64,
-            if_then_else(
-                action == 1,
-                T.Cast("float64", T.Cast("float32", a_q_f64) * T.Cast("float32", x_q_f64)),
-                if_then_else(
-                    action == 2,
-                    T.Cast("float64", T.Cast("bfloat16", a_q_f64) * T.Cast("bfloat16", x_q_f64)),
-                    T.float64(0),
-                ),
-            ),
+            action == 1,
+            T.Cast("float32", clipped_val),
+            T.Cast("bfloat16", clipped_val),
         )
 
     @T.prim_func
@@ -146,40 +113,36 @@ def make_csc_spmv_mixed_prequant_kernel_warp_reduce(
             warp = T.get_warp_idx_sync() # 0 to WARPS_PER_BLOCK-1, warp index within block
             lane = T.get_lane_idx() # 0 to THREADS_PER_WARP-1, thread index within warp
             col = bx * WARPS_PER_BLOCK + warp
-            # Per-warp scratch
+            # alloc registers
             action_local = T.alloc_local((1,), "int32")
-            x_lane_f64 = T.alloc_local((1,), "float64")
-            x_lane_f32 = T.alloc_local((1,), "float32")
-            x_lane_bf16 = T.alloc_local((1,), "bfloat16")
+            x_lane_fp64 = T.alloc_fragment((WARPS_PER_BLOCK,), "float64")
+            x_lane_f32 = T.alloc_fragment((WARPS_PER_BLOCK,), "float32")
+            x_lane_bf16 = T.alloc_fragment((WARPS_PER_BLOCK,), "bfloat16")
+                        
+            # load action and x to register
+            action_local[0] = actions[col//C]
+            qmax = get_qmax(action_local[0])
+            for i in T.Parallel(WARPS_PER_BLOCK):
+                x_lane_fp64[i] = x[col]
+            T.sync_threads()
+                      
 
             if col < N:
                 start = colptr[col]
                 end = colptr[col + 1]
 
-                # Get action for this column (per block-column)
-                bc = col // C  # block-column index
-                action_local[0] = actions[col//C] # All elements in this column share the same action
-
-                # Load x[col] - all threads read the same value (coalesced access is fine)
-                # Since all threads in warp process the same column, they all need x[col]
-                x_col_raw = x[col]
-
                 # Compute x_scale for this column's action
-                qmax = get_qmax(action_local[0])
                 x_scale = T.float64(1.0)
-                if action_local[0] >= 1:
-                    x_max_abs = T.abs(x_col_raw)
-                    x_scale = qmax / (x_max_abs + T.float64(1e-12))
+                if action_local[0] == 1 or action_local[0] == 2:
+                    x_scale = qmax / (x_lane_fp64[warp] + T.float64(1e-12))
 
                 # Quantize x[col] once based on column's action
-                if action_local[0] == 0:
-                    x_lane_f64[0] = x_col_raw
-                elif action_local[0] == 1:
-                    x_q_f64 = quantize_scaled_value(x_col_raw, x_scale, qmax, action_local[0])
-                    x_lane_f32[0] = T.Cast("float32", x_q_f64)
-                else:  # action == 2
-                    x_q_f64 = quantize_scaled_value(x_col_raw, x_scale, qmax, action_local[0])
-                    x_lane_bf16[0] = T.Cast("bfloat16", x_q_f64)
+                if action_local[0] == 1:
+                    x_q = quantize_scaled_value(x_lane_fp64[warp], x_scale, qmax, action_local[0])
+                    x_lane_f32[warp] = x_q
+                elif action_local[0] == 2:
+                    x_q = quantize_scaled_value(x_lane_fp64[warp], x_scale, qmax, action_local[0])
+                    x_lane_bf16[warp] = x_q
 
                 # Iterate non-zeros in this column
                 # Distribute work across warp lanes to avoid redundant computation
@@ -209,23 +172,81 @@ def make_csc_spmv_mixed_prequant_kernel_warp_reduce(
                         if action_local[0] == 0:
                             # fp64: use original x value
                             a_val = data_fp64[k]
-                            prod = a_val * x_lane_f64[0]
+                            prod = a_val * x_lane_fp64[warp]
                             if row_idx < M:
                                 T.atomic_add(y[row_idx], prod)
                         elif action_local[0] == 1:
                             # fp32: use fp32 quantized x
                             a_f32 = data_fp32_q[k]
-                            prod_f32 = a_f32 * x_lane_f32[0]
+                            prod_f32 = a_f32 * x_lane_f32[warp]
                             prod_f64 = T.Cast("float64", prod_f32)
                             if row_idx < M:
                                 T.atomic_add(y[row_idx], prod_f64 * inv_scale)
                         else:  # action == 2
                             # bf16: use bf16 quantized x
                             a_bf16 = data_bf16_q[k]
-                            prod_bf16 = a_bf16 * x_lane_bf16[0]
+                            prod_bf16 = a_bf16 * x_lane_bf16[warp]
                             prod_f64 = T.Cast("float64", prod_bf16)
                             if row_idx < M:
                                 T.atomic_add(y[row_idx], prod_f64 * inv_scale)
+
+    return main
+
+
+@tilelang.jit(target="cuda")
+def make_csc_spmv_kernel(
+    M: int,
+    N: int,
+    nnz: int,
+):
+    """
+    仅参考你提供的 CUDA `CSC_SpMV_kernel` 写法：纯 fp64 的 CSC SpMV。
+
+    等价逻辑（CUDA）：
+      global_id = blockIdx.x * blockDim.x + threadIdx.x
+      for col = global_id; col < N; col += blockDim.x * gridDim.x:
+          for j in [colptr[col], colptr[col+1]):
+              atomicAdd(&y[rowind[j]], values[j] * x[col])
+
+    注意：CSC 多列会写同一 row，所以必须 atomic_add。
+    """
+    block_size = 64
+    try:
+        num_sms = int(torch.cuda.get_device_properties(0).multi_processor_count) if torch.cuda.is_available() else 80
+    except Exception:
+        num_sms = 80
+    grid_size = 32 * num_sms
+    stride = block_size * grid_size
+    n_iters = (int(N) + stride - 1) // stride
+
+    @T.prim_func
+    def main(
+        colptr: T.Tensor((N + 1,), "int32"),  # type: ignore
+        rowind: T.Tensor((nnz,), "int32"),  # type: ignore
+        values: T.Tensor((nnz,), "float64"),  # type: ignore
+        x: T.Tensor((N,), "float64"),  # type: ignore
+        y: T.Tensor((M,), "float64"),  # type: ignore
+    ):
+        with T.Kernel(grid_size, threads=block_size) as bx:
+            tx = T.get_thread_binding(0)
+            global_id = bx * block_size + tx
+
+            x_fp64 = T.alloc_local((1,), "float64")
+
+            # grid-stride over columns (和 CUDA 一致)
+            for it in T.serial(n_iters):
+                col = global_id + it * stride
+                if col < N:
+                    x_fp64[0] = x[col]
+                    start = colptr[col]
+                    end = colptr[col + 1]
+
+                    # 遍历该列的 nnz：y[row] += values[j] * x[col]
+                    for j in T.serial(end - start):
+                        k = start + j
+                        row = rowind[k]
+                        if row < M:
+                            T.atomic_add(y[row], values[k] * x_fp64[0])
 
     return main
 
