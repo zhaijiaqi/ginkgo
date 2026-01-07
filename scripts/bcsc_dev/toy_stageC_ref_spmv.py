@@ -136,26 +136,41 @@ def main():
             if action >= 1:
                 print(f"[DEBUG]   x_q(f64-carrying)={x_q.cpu().numpy()}")
 
+            # Runtime quantization: compute scale per column
             for k in range(start, end):
-                A_tile = bcsc.A_fp64[k]
-                a_max_abs = torch.max(torch.abs(A_tile))
-                a_scale_rt = torch.tensor(float(max_val), dtype=torch.float64) / (a_max_abs + float(eps))
-                a_q_rt = _quantize_scaled_value_f64(A_tile, a_scale_rt, max_val, action) if action >= 1 else A_tile
-
-                if action == 1:
-                    a_scale_pre = bcsc.a_scale_fp32[k]
-                    a_q_pre = bcsc.A_fp32_q[k].to(torch.float64)
-                elif action == 2:
-                    a_scale_pre = bcsc.a_scale_bf16[k]
-                    a_q_pre = bcsc.A_bf16_q[k].to(torch.float64)
-                else:
-                    a_scale_pre = torch.tensor(1.0, dtype=torch.float64)
-                    a_q_pre = A_tile
-
-                ds = float((a_scale_pre - a_scale_rt).abs().item())
-                dq = float((a_q_pre - a_q_rt).abs().max().item())
-                if ds != 0.0 or dq != 0.0:
-                    print(f"[DEBUG]   k={k} br={int(bcsc.rowind[k].item())} |a_scale_pre-a_scale_rt|={ds:.3e} max|a_q_pre-a_q_rt|={dq:.3e}")
+                A_tile = bcsc.A_fp64[k]  # [R, C]
+                
+                # For each column in this tile, compute runtime scale and compare with pre-quantized scale
+                for cc in range(bcsc.C):
+                    global_col = col_base + cc
+                    if global_col >= bcsc.N:
+                        break
+                    
+                    # Runtime quantization: find max abs for this column across all tiles in this block-column
+                    col_tiles_rt = bcsc.A_fp64[start:end]  # [num_tiles, R, C]
+                    col_values_rt = col_tiles_rt[:, :, cc]  # [num_tiles, R]
+                    a_max_abs_col = torch.max(torch.abs(col_values_rt))
+                    a_scale_rt_col = torch.tensor(float(max_val), dtype=torch.float64) / (a_max_abs_col + float(eps))
+                    
+                    # Pre-quantized scale for this column
+                    if action == 1:
+                        a_scale_pre_col = bcsc.a_scale_fp32[global_col]
+                        col_q_pre = bcsc.A_fp32_q[k][:, cc].to(torch.float64)
+                    elif action == 2:
+                        a_scale_pre_col = bcsc.a_scale_bf16[global_col]
+                        col_q_pre = bcsc.A_bf16_q[k][:, cc].to(torch.float64)
+                    else:
+                        a_scale_pre_col = torch.tensor(1.0, dtype=torch.float64)
+                        col_q_pre = A_tile[:, cc]
+                    
+                    # Runtime quantized value for this column
+                    col_tile_rt = A_tile[:, cc]  # [R]
+                    col_q_rt = _quantize_scaled_value_f64(col_tile_rt, a_scale_rt_col, max_val, action) if action >= 1 else col_tile_rt
+                    
+                    ds = float((a_scale_pre_col - a_scale_rt_col).abs().item())
+                    dq = float((col_q_pre - col_q_rt).abs().max().item())
+                    if ds != 0.0 or dq != 0.0:
+                        print(f"[DEBUG]   k={k} br={int(bcsc.rowind[k].item())} cc={cc} col={global_col} |a_scale_pre-a_scale_rt|={ds:.3e} max|a_q_pre-a_q_rt|={dq:.3e}")
 
         # Fail with context
         raise AssertionError(f"prequant ref != runtime-quant ref: {e}") from e

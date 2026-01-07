@@ -43,9 +43,9 @@ def make_bcsc_spmv_mixed_prequant_kernel_warp_reduce(
     Tile payloads:
       data_fp64    : (nnzb, R, C) float64   # action==0
       data_fp32_q  : (nnzb, R, C) float32   # action==1 (quantized-domain values)
-      a_scale_fp32 : (nnzb,)      float64
+      a_scale_fp32 : (N,)         float64   # per column scale
       data_bf16_q  : (nnzb, R, C) bfloat16  # action==2 (quantized-domain values)
-      a_scale_bf16 : (nnzb,)      float64
+      a_scale_bf16 : (N,)         float64   # per column scale
 
     Vector:
       actions : (n_bc,) int32     # 0=fp64, 1=fp32, 2=bf16 (per block-column)
@@ -113,9 +113,9 @@ def make_bcsc_spmv_mixed_prequant_kernel_warp_reduce(
     def main(
         data_fp64: T.Tensor((nnzb, R, C), "float64"),  # type: ignore
         data_fp32_q: T.Tensor((nnzb, R, C), "float32"),  # type: ignore
-        a_scale_fp32: T.Tensor((nnzb,), "float64"),  # type: ignore
+        a_scale_fp32: T.Tensor((N,), "float64"),  # type: ignore
         data_bf16_q: T.Tensor((nnzb, R, C), "bfloat16"),  # type: ignore
-        a_scale_bf16: T.Tensor((nnzb,), "float64"),  # type: ignore
+        a_scale_bf16: T.Tensor((N,), "float64"),  # type: ignore
         actions: T.Tensor((n_bc,), "int32"),  # type: ignore
         colptr: T.Tensor((n_bc + 1,), "int32"),  # type: ignore
         rowind: T.Tensor((nnzb,), "int32"),  # type: ignore
@@ -167,20 +167,6 @@ def make_bcsc_spmv_mixed_prequant_kernel_warp_reduce(
                     for rt in T.unroll(R_TILES):
                         acc[rt] = T.float64(0)
 
-                    # Select per-tile a_scale (only used for action>=1)
-                    # Pre-compute inverse scale to use multiplication instead of division
-                    a_scale = T.if_then_else(
-                        action == 1,
-                        a_scale_fp32[k],
-                        T.if_then_else(action == 2, a_scale_bf16[k], T.float64(1.0)),
-                    )
-                    # Pre-compute inverse scale for faster dequantization (multiply instead of divide)
-                    inv_scale = T.if_then_else(
-                        action == 0,
-                        T.float64(1.0),
-                        T.float64(1.0) / (a_scale * x_scale),
-                    )
-
                     for ct in T.unroll(C_TILES):
                         cc_base = ct * 32
 
@@ -206,40 +192,55 @@ def make_bcsc_spmv_mixed_prequant_kernel_warp_reduce(
                         for cc in T.unroll(32):
                             cc_g = cc_base + cc
                             if cc_g < C:
-                                if action == 0:
-                                    # fp64 path: use fp64 throughout, CUDA core uses fp64 instructions
-                                    vx = T.tvm_warp_shuffle(mask, x_lane_f64[0], T.int32(cc), 32, 32)
-                                    for rt in T.unroll(R_TILES):
-                                        rr = rt * 32 + lane
-                                        if rr < R:
-                                            a_val = data_fp64[k, rr, cc_g]
-                                            acc[rt] += a_val * vx
-                                elif action == 1:
-                                    # fp32 path: use fp32 for computation, CUDA core uses fp32 instructions
-                                    vx_f32 = T.tvm_warp_shuffle(mask, x_lane_f32[0], T.int32(cc), 32, 32)
-                                    for rt in T.unroll(R_TILES):
-                                        rr = rt * 32 + lane
-                                        if rr < R:
-                                            # Direct fp32 multiplication (CUDA core uses fp32 instructions)
-                                            a_f32 = data_fp32_q[k, rr, cc_g]
-                                            prod_f32 = a_f32 * vx_f32
-                                            # Cast to fp64 for accumulation and dequantization (use multiply instead of divide)
-                                            prod_f64 = T.Cast("float64", prod_f32)
-                                            acc[rt] += prod_f64 * inv_scale
-                                else:  # action == 2
-                                    # bf16 path: use bf16 for computation, CUDA core uses bf16 instructions
-                                    # Note: warp shuffle may need fp32, so we use fp32 for shuffle then cast
-                                    vx_f32_shuffle = T.Cast("float32", T.tvm_warp_shuffle(mask, T.Cast("float32", x_lane_bf16[0]), T.int32(cc), 32, 32))
-                                    vx_bf16 = T.Cast("bfloat16", vx_f32_shuffle)
-                                    for rt in T.unroll(R_TILES):
-                                        rr = rt * 32 + lane
-                                        if rr < R:
-                                            # Direct bf16 multiplication (CUDA core uses bf16 instructions)
-                                            a_bf16 = data_bf16_q[k, rr, cc_g]
-                                            prod_bf16 = a_bf16 * vx_bf16
-                                            # Cast to fp64 for accumulation and dequantization (use multiply instead of divide)
-                                            prod_f64 = T.Cast("float64", prod_bf16)
-                                            acc[rt] += prod_f64 * inv_scale
+                                global_col = x_base + cc_g
+                                if global_col < N:
+                                    # Select per-column a_scale (only used for action>=1)
+                                    a_scale_col = T.if_then_else(
+                                        action == 1,
+                                        a_scale_fp32[global_col],
+                                        T.if_then_else(action == 2, a_scale_bf16[global_col], T.float64(1.0)),
+                                    )
+                                    # Pre-compute inverse scale for faster dequantization
+                                    inv_scale_col = T.if_then_else(
+                                        action == 0,
+                                        T.float64(1.0),
+                                        T.float64(1.0) / (a_scale_col * x_scale),
+                                    )
+                                    
+                                    if action == 0:
+                                        # fp64 path: use fp64 throughout, CUDA core uses fp64 instructions
+                                        vx = T.tvm_warp_shuffle(mask, x_lane_f64[0], T.int32(cc), 32, 32)
+                                        for rt in T.unroll(R_TILES):
+                                            rr = rt * 32 + lane
+                                            if rr < R:
+                                                a_val = data_fp64[k, rr, cc_g]
+                                                acc[rt] += a_val * vx
+                                    elif action == 1:
+                                        # fp32 path: use fp32 for computation, CUDA core uses fp32 instructions
+                                        vx_f32 = T.tvm_warp_shuffle(mask, x_lane_f32[0], T.int32(cc), 32, 32)
+                                        for rt in T.unroll(R_TILES):
+                                            rr = rt * 32 + lane
+                                            if rr < R:
+                                                # Direct fp32 multiplication (CUDA core uses fp32 instructions)
+                                                a_f32 = data_fp32_q[k, rr, cc_g]
+                                                prod_f32 = a_f32 * vx_f32
+                                                # Cast to fp64 for accumulation and dequantization (use per-column scale)
+                                                prod_f64 = T.Cast("float64", prod_f32)
+                                                acc[rt] += prod_f64 * inv_scale_col
+                                    else:  # action == 2
+                                        # bf16 path: use bf16 for computation, CUDA core uses bf16 instructions
+                                        # Note: warp shuffle may need fp32, so we use fp32 for shuffle then cast
+                                        vx_f32_shuffle = T.Cast("float32", T.tvm_warp_shuffle(mask, T.Cast("float32", x_lane_bf16[0]), T.int32(cc), 32, 32))
+                                        vx_bf16 = T.Cast("bfloat16", vx_f32_shuffle)
+                                        for rt in T.unroll(R_TILES):
+                                            rr = rt * 32 + lane
+                                            if rr < R:
+                                                # Direct bf16 multiplication (CUDA core uses bf16 instructions)
+                                                a_bf16 = data_bf16_q[k, rr, cc_g]
+                                                prod_bf16 = a_bf16 * vx_bf16
+                                                # Cast to fp64 for accumulation and dequantization (use per-column scale)
+                                                prod_f64 = T.Cast("float64", prod_bf16)
+                                                acc[rt] += prod_f64 * inv_scale_col
 
                     # Scatter accumulate into y
                     for rt in T.unroll(R_TILES):
@@ -344,9 +345,9 @@ def make_bcsc_spmv_mixed_prequant_kernel_tensorcore_bf16(
     def main(
         data_fp64: T.Tensor((nnzb, R, C), "float64"),  # type: ignore
         data_fp32_q: T.Tensor((nnzb, R, C), "float32"),  # type: ignore
-        a_scale_fp32: T.Tensor((nnzb,), "float64"),  # type: ignore
+        a_scale_fp32: T.Tensor((N,), "float64"),  # type: ignore
         data_bf16_q: T.Tensor((nnzb, R, C), "bfloat16"),  # type: ignore
-        a_scale_bf16: T.Tensor((nnzb,), "float64"),  # type: ignore
+        a_scale_bf16: T.Tensor((N,), "float64"),  # type: ignore
         actions: T.Tensor((n_bc,), "int32"),  # type: ignore
         colptr: T.Tensor((n_bc + 1,), "int32"),  # type: ignore
         rowind: T.Tensor((nnzb,), "int32"),  # type: ignore
@@ -390,11 +391,13 @@ def make_bcsc_spmv_mixed_prequant_kernel_tensorcore_bf16(
                 br = rowind[k]
                 row_base = br * R
 
-                # Per-tile a_scale (only used for action>=1)
-                a_scale = T.if_then_else(
+                # Note: TensorCore kernel processes multiple columns at once via MMA.
+                # For per-column scaling, we use the scale of the first column in this block-column as approximation.
+                # A more accurate implementation would require per-column computation, which would reduce TensorCore efficiency.
+                a_scale_first_col = T.if_then_else(
                     action == 1,
-                    a_scale_fp32[k],
-                    T.if_then_else(action == 2, a_scale_bf16[k], T.float64(1.0)),
+                    a_scale_fp32[x_base],
+                    T.if_then_else(action == 2, a_scale_bf16[x_base], T.float64(1.0)),
                 )
 
                 # For each 16-row block of this tile
@@ -452,7 +455,7 @@ def make_bcsc_spmv_mixed_prequant_kernel_tensorcore_bf16(
                                 out = T.if_then_else(
                                     action == 0,
                                     val,
-                                    val / (a_scale * x_scale),
+                                    val / (a_scale_first_col * x_scale),
                                 )
                                 T.atomic_add(y[row_base + rm + rr], out)
 

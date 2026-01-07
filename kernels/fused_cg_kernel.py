@@ -4,7 +4,7 @@ import tilelang
 import tilelang.language as T
 import torch
 from scipy.io import mmread
-from kernel_utils import benchmark_kernel
+from .kernel_utils import benchmark_kernel
 
 
 @tilelang.jit(target="cuda")
@@ -126,29 +126,33 @@ def make_fused_cg_step_kernel(
                     smem_mu_p[tx] += smem_mu_p[tx + 64]
                 T.sync_threads()
 
-            # Warp-synchronous reduction
-            # if block_size >= 64:
-            #     if tx < 32:
-            #         smem_rr[tx] += smem_rr[tx + 32]
-            #         smem_mu_p[tx] += smem_mu_p[tx + 32]
-            # if tx < 16:
-            #     smem_rr[tx] += smem_rr[tx + 16]
-            #     smem_mu_p[tx] += smem_mu_p[tx + 16]
-            # if tx < 8:
-            #     smem_rr[tx] += smem_rr[tx + 8]
-            #     smem_mu_p[tx] += smem_mu_p[tx + 8]
-            # if tx < 4:
-            #     smem_rr[tx] += smem_rr[tx + 4]
-            #     smem_mu_p[tx] += smem_mu_p[tx + 4]
-            # if tx < 2:
-            #     smem_rr[tx] += smem_rr[tx + 2]
-            #     smem_mu_p[tx] += smem_mu_p[tx + 2]
-            # if tx < 1:
-            #     smem_rr[tx] += smem_rr[tx + 1]
-            #     smem_mu_p[tx] += smem_mu_p[tx + 1]
-                
-            T.warp_reduce_sum(smem_rr, 0)
-            T.warp_reduce_sum(smem_mu_p, 0)
+            # Warp-synchronous reduction (reduce from 64 to 32, then within warp)
+            if block_size >= 64:
+                if tx < 32:
+                    smem_rr[tx] += smem_rr[tx + 32]
+                    smem_mu_p[tx] += smem_mu_p[tx + 32]
+                T.sync_threads()
+            # Within-warp reduction (32 threads -> 1)
+            if tx < 16:
+                smem_rr[tx] += smem_rr[tx + 16]
+                smem_mu_p[tx] += smem_mu_p[tx + 16]
+            T.sync_threads()
+            if tx < 8:
+                smem_rr[tx] += smem_rr[tx + 8]
+                smem_mu_p[tx] += smem_mu_p[tx + 8]
+            T.sync_threads()
+            if tx < 4:
+                smem_rr[tx] += smem_rr[tx + 4]
+                smem_mu_p[tx] += smem_mu_p[tx + 4]
+            T.sync_threads()
+            if tx < 2:
+                smem_rr[tx] += smem_rr[tx + 2]
+                smem_mu_p[tx] += smem_mu_p[tx + 2]
+            T.sync_threads()
+            if tx < 1:
+                smem_rr[tx] += smem_rr[tx + 1]
+                smem_mu_p[tx] += smem_mu_p[tx + 1]
+            T.sync_threads()
 
             # Thread 0 computes aj and stores in shared memory
             if tx == 0:

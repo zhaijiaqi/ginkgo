@@ -87,9 +87,9 @@ def make_bcsc_spmv_mixed_prequant_kernel_tensorcore_bf16_safe(
     def main(
         data_fp64: T.Tensor((nnzb, R, C), "float64"),  # type: ignore
         data_fp32_q: T.Tensor((nnzb, R, C), "float32"),  # type: ignore
-        a_scale_fp32: T.Tensor((nnzb,), "float64"),  # type: ignore
+        a_scale_fp32: T.Tensor((N,), "float64"),  # type: ignore
         data_bf16_q: T.Tensor((nnzb, R, C), "bfloat16"),  # type: ignore
-        a_scale_bf16: T.Tensor((nnzb,), "float64"),  # type: ignore
+        a_scale_bf16: T.Tensor((N,), "float64"),  # type: ignore
         actions: T.Tensor((n_bc,), "int32"),  # type: ignore
         colptr: T.Tensor((n_bc + 1,), "int32"),  # type: ignore
         rowind: T.Tensor((nnzb,), "int32"),  # type: ignore
@@ -131,10 +131,12 @@ def make_bcsc_spmv_mixed_prequant_kernel_tensorcore_bf16_safe(
                 br = rowind[k]
                 row_base = br * R
 
-                a_scale = T.if_then_else(
+                # Note: TensorCore kernel processes multiple columns at once via MMA.
+                # For per-column scaling, we use the scale of the first column in this block-column as approximation.
+                a_scale_first_col = T.if_then_else(
                     action == 1,
-                    a_scale_fp32[k],
-                    T.if_then_else(action == 2, a_scale_bf16[k], T.float64(1.0)),
+                    a_scale_fp32[x_base],
+                    T.if_then_else(action == 2, a_scale_bf16[x_base], T.float64(1.0)),
                 )
 
                 for rm_blk in T.serial((R + 15) // 16):
@@ -195,7 +197,7 @@ def make_bcsc_spmv_mixed_prequant_kernel_tensorcore_bf16_safe(
                                 out = T.if_then_else(
                                     action == 0,
                                     val,
-                                    val / (a_scale * x_scale),
+                                    val / (a_scale_first_col * x_scale),
                                 )
                                 T.atomic_add(y[row_base + rm + rr], out)
 

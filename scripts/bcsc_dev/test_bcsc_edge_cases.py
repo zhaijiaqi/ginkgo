@@ -41,7 +41,8 @@ def test_empty_matrix():
     assert torch.all(bcsc.colptr == 0), "Empty matrix: all colptr should be 0"
 
     bcsc = quantize_bcsc_tiles(bcsc)
-    assert bcsc.a_scale_fp32 is not None and len(bcsc.a_scale_fp32) == 0, "Empty: a_scale should be empty tensor"
+    # Scale is now per column, so it should have N elements
+    assert bcsc.a_scale_fp32 is not None and len(bcsc.a_scale_fp32) == bcsc.N, f"Empty: a_scale should have N={bcsc.N} elements, got {len(bcsc.a_scale_fp32)}"
 
     # SpMV on empty matrix should return zeros
     x = torch.ones((N,), dtype=torch.float64)
@@ -67,7 +68,8 @@ def test_single_tile():
     assert bcsc.n_br == 1 and bcsc.n_bc == 1, f"Single tile: n_br={bcsc.n_br}, n_bc={bcsc.n_bc}"
 
     bcsc = quantize_bcsc_tiles(bcsc)
-    assert bcsc.a_scale_fp32 is not None and len(bcsc.a_scale_fp32) == 1, "Single tile: a_scale should have 1 element"
+    # Scale is now per column, so it should have N elements
+    assert bcsc.a_scale_fp32 is not None and len(bcsc.a_scale_fp32) == bcsc.N, f"Single tile: a_scale should have N={bcsc.N} elements, got {len(bcsc.a_scale_fp32)}"
 
     # Test SpMV
     x = torch.ones((N,), dtype=torch.float64)

@@ -1123,34 +1123,26 @@ class CGEnvironment:
         Returns:
             (residual_norm, prev_residual_norm, converged, done, diverged)
         """
-        if not (torch.is_tensor(self.r) and torch.is_tensor(self.p) and torch.is_tensor(self.x) and torch.is_tensor(self.Ap)):
-            raise RuntimeError("当前版本默认使用 torch 常驻状态：x/r/p/Ap 必须为 torch.Tensor。")
-
-        r_t = self.r
-        p_t = self.p
-        x_t = self.x
-        Ap_t = self.Ap
-
-        # prev_residual_norm = ||r||
-        prev_residual_norm = float(torch.linalg.vector_norm(r_t, ord=2).item())
-
-        # 使用融合内核完成 CG 迭代步骤
-        # fused_cg_step 会修改 r, p, x 的值，并返回 stats: [||r||², ||r_new||², aj]
-        # 其中 mu 对应 Ap
-        if not torch.cuda.is_available():
-            raise RuntimeError("融合 CG 内核需要 CUDA，但 CUDA 不可用")
         
-        # 确保所有 tensor 都在 CUDA 上
-        if r_t.device.type != "cuda":
-            raise RuntimeError(f"融合 CG 内核需要 tensor 在 CUDA 上，但 r 在 {r_t.device} 上")
+        # 在调用 kernel 之前计算并保存当前的残差范数
+        prev_residual_norm = float(torch.linalg.vector_norm(self.r, ord=2).item())
         
-        device = str(r_t.device)
-        stats = fused_cg_step(r_t, Ap_t, p_t, x_t, device=device, block_size=256)
+        device = str(self.r.device)
+        stats = fused_cg_step(
+            self.r, self.Ap, self.p, self.x,
+            b_norm=self.b_norm,
+            stop_tol=self.stop_tol,
+            device=device,
+            block_size=256
+        )
         
-        # 提取统计信息
-        r_dot_r_old = float(stats[0].item())  # ||r||² (旧)
-        r_dot_r_new = float(stats[1].item())  # ||r_new||² (新)
+        # 从 kernel 返回的 stats 中提取所有信息（所有计算已在 kernel 中完成）
+        residual_norm = float(stats[3].item())  # sqrt(||r_new||²)
+        converged = bool(stats[4].item() > 0.5)  # converged flag
         aj = float(stats[2].item())  # alpha (aj)
+        
+        # 记录残差
+        self.residual_tracker.record_residual(residual_norm)
         
         # 检查发散：如果 aj == 0，说明 p_dot_Ap <= 1e-307（fused kernel 在分母过小时返回 0.0）
         diverged = False
@@ -1159,24 +1151,14 @@ class CGEnvironment:
             diverged = True
             done = True
             converged = False
-            current_residual_norm = prev_residual_norm
-            return current_residual_norm, prev_residual_norm, converged, done, diverged
-
-        # residual_norm = ||r_new|| = sqrt(||r_new||²)
-        residual_norm = float(np.sqrt(r_dot_r_new))
-        self.residual_tracker.record_residual(residual_norm)
-
-        converged = (residual_norm / self.b_norm) < self.stop_tol
+            return residual_norm, prev_residual_norm, converged, done, diverged
 
         # 重置 Ap 为下一次迭代
         self.Ap = None
 
         done = converged or (self.current_iteration >= self.max_iter - 1)
 
-        # torch 常驻：保持 torch（fused_cg_step 已经原地修改了 r, p, x）
-        self.x = x_t
-        self.r = r_t
-        self.p = p_t
+        # 注意：fused_cg_step 已经原地修改了 self.r, self.p, self.x，无需重新赋值
 
         return residual_norm, prev_residual_norm, converged, done, diverged
 

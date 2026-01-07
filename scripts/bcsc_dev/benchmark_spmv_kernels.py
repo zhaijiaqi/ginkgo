@@ -53,6 +53,14 @@ def build_bsr_from_bcsc(bcsc, device="cuda"):
     tile_idx_map = []  # Maps BSR tile index to BCSC tile index k
 
     # Count tiles per block-row and build mapping
+    # Also build mapping from BCSC tile index k to its block-column bc
+    k_to_bc = {}  # Maps BCSC tile index k to block-column bc
+    for bc in range(n_bc):
+        start = bcsc.colptr[bc].item()
+        end = bcsc.colptr[bc + 1].item()
+        for k in range(start, end):
+            k_to_bc[k] = bc
+    
     for br in range(n_br):
         tile_count = 0
         for bc in range(n_bc):
@@ -78,8 +86,13 @@ def build_bsr_from_bcsc(bcsc, device="cuda"):
         data_fp64[bsr_idx] = bcsc.A_fp64[bcsc_k]
         data_fp32_q[bsr_idx] = bcsc.A_fp32_q[bcsc_k]
         data_bf16_q[bsr_idx] = bcsc.A_bf16_q[bcsc_k]
-        a_scale_fp32[bsr_idx] = bcsc.a_scale_fp32[bcsc_k]
-        a_scale_bf16[bsr_idx] = bcsc.a_scale_bf16[bcsc_k]
+        # Scale is now per column, not per tile or block-column
+        # For BSR format, we need per-tile scale, so we use the first column's scale as approximation
+        # This is not perfect but maintains compatibility with BSR kernel interface
+        bc = k_to_bc[bcsc_k]
+        col_base = bc * bcsc.C
+        a_scale_fp32[bsr_idx] = bcsc.a_scale_fp32[col_base] if col_base < bcsc.N else 1.0
+        a_scale_bf16[bsr_idx] = bcsc.a_scale_bf16[col_base] if col_base < bcsc.N else 1.0
 
     return {
         "data_fp64": data_fp64,

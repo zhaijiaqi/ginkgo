@@ -50,9 +50,9 @@ class BCSCMatrix:
 
     # Optional pre-quantized payloads (filled by `quantize_bcsc_tiles`)
     A_fp32_q: Optional[torch.Tensor] = None  # float32 [nnzb, R, C]
-    a_scale_fp32: Optional[torch.Tensor] = None  # float64 [nnzb]
+    a_scale_fp32: Optional[torch.Tensor] = None  # float64 [N] - per column scale
     A_bf16_q: Optional[torch.Tensor] = None  # bfloat16 [nnzb, R, C]
-    a_scale_bf16: Optional[torch.Tensor] = None  # float64 [nnzb]
+    a_scale_bf16: Optional[torch.Tensor] = None  # float64 [N] - per column scale
 
     def to(self, device: torch.device | str) -> "BCSCMatrix":
         dev = torch.device(device)
@@ -257,37 +257,112 @@ def quantize_bcsc_tiles(
     eps: float = DEFAULT_EPS_F64,
 ) -> BCSCMatrix:
     """
-    Pre-quantize all non-zero tiles into fp32/bf16 quantized-domain values, and store per-tile a_scale.
+    Pre-quantize all non-zero tiles into fp32/bf16 quantized-domain values, and store per column a_scale.
+    
+    For each column j (0 <= j < N), compute a_scale[j] based on the maximum absolute value
+    across all tiles that contain column j.
     """
     A = bcsc.A_fp64
     if A.numel() == 0:
         bcsc.A_fp32_q = torch.zeros_like(A, dtype=torch.float32)
-        bcsc.a_scale_fp32 = torch.zeros((0,), dtype=torch.float64, device=A.device)
+        bcsc.a_scale_fp32 = torch.ones((bcsc.N,), dtype=torch.float64, device=A.device)
         bcsc.A_bf16_q = torch.zeros_like(A, dtype=torch.bfloat16)
-        bcsc.a_scale_bf16 = torch.zeros((0,), dtype=torch.float64, device=A.device)
+        bcsc.a_scale_bf16 = torch.ones((bcsc.N,), dtype=torch.float64, device=A.device)
         return bcsc
 
-    a_max_abs = torch.amax(torch.abs(A), dim=(1, 2))  # [nnzb]
-
-    # fp32 path (mul-safe)
+    # Compute per column max absolute value
+    # For each column j, find max(abs(A[k, :, cc])) for all tiles k and column positions cc
+    # where the global column index bc*C + cc == j
+    a_scale_fp32_per_col = torch.ones((bcsc.N,), dtype=torch.float64, device=A.device)
+    a_scale_bf16_per_col = torch.ones((bcsc.N,), dtype=torch.float64, device=A.device)
+    
     qmax32 = torch.tensor(float(qmax_fp32), dtype=torch.float64, device=A.device)
-    a_scale32 = qmax32 / (a_max_abs + float(eps))
-    A32_scaled = A * a_scale32[:, None, None]
-    A32_clipped = torch.clamp(A32_scaled, min=-float(qmax_fp32), max=float(qmax_fp32))
-    A_fp32_q = A32_clipped.to(torch.float32)
-
-    # bf16 path (mul-safe)
     qmaxbf = torch.tensor(float(qmax_bf16), dtype=torch.float64, device=A.device)
-    a_scalebf = qmaxbf / (a_max_abs + float(eps))
-    Abf_scaled = A * a_scalebf[:, None, None]
-    # mul-safe already, but still clamp to qmax_bf16 for consistency
-    Abf_clipped = torch.clamp(Abf_scaled, min=-float(qmax_bf16), max=float(qmax_bf16))
-    A_bf16_q = Abf_clipped.to(torch.bfloat16)
+    
+    # For each column j, collect all values from tiles that contain this column
+    col_max_abs_fp32 = torch.zeros((bcsc.N,), dtype=torch.float64, device=A.device)
+    col_max_abs_bf16 = torch.zeros((bcsc.N,), dtype=torch.float64, device=A.device)
+    
+    for bc in range(bcsc.n_bc):
+        start = int(bcsc.colptr[bc].item())
+        end = int(bcsc.colptr[bc + 1].item())
+        if end <= start:
+            continue
+        
+        col_base = bc * bcsc.C
+        tiles_in_col = A[start:end]  # [num_tiles_in_col, R, C]
+        
+        # For each column position cc in this block-column
+        for cc in range(bcsc.C):
+            global_col = col_base + cc
+            if global_col >= bcsc.N:
+                break
+            
+            # Find max absolute value in this column across all tiles in this block-column
+            # tiles_in_col[:, :, cc] gives all values in column cc for all tiles
+            col_values = tiles_in_col[:, :, cc]  # [num_tiles_in_col, R]
+            col_max = torch.amax(torch.abs(col_values))
+            col_max_abs_fp32[global_col] = torch.maximum(col_max_abs_fp32[global_col], col_max)
+            col_max_abs_bf16[global_col] = torch.maximum(col_max_abs_bf16[global_col], col_max)
+    
+    # Compute scales for each column
+    a_scale_fp32_per_col = qmax32 / (col_max_abs_fp32 + float(eps))
+    a_scale_bf16_per_col = qmaxbf / (col_max_abs_bf16 + float(eps))
+
+    # Quantize all tiles using per-column scales
+    A_fp32_q_list = []
+    A_bf16_q_list = []
+    
+    for bc in range(bcsc.n_bc):
+        start = int(bcsc.colptr[bc].item())
+        end = int(bcsc.colptr[bc + 1].item())
+        if end <= start:
+            continue
+        
+        col_base = bc * bcsc.C
+        tiles_in_col = A[start:end]  # [num_tiles_in_col, R, C]
+        
+        # For each tile, apply per-column scaling
+        # Tile shape: [R, C], we need to scale each column cc by scale[col_base + cc]
+        A32_scaled_list = []
+        Abf_scaled_list = []
+        
+        for tile_idx in range(tiles_in_col.shape[0]):
+            tile = tiles_in_col[tile_idx]  # [R, C]
+            tile_fp32_scaled = torch.zeros_like(tile, dtype=torch.float64)
+            tile_bf16_scaled = torch.zeros_like(tile, dtype=torch.float64)
+            
+            for cc in range(bcsc.C):
+                global_col = col_base + cc
+                if global_col >= bcsc.N:
+                    break
+                
+                scale32 = a_scale_fp32_per_col[global_col]
+                scalebf = a_scale_bf16_per_col[global_col]
+                
+                tile_fp32_scaled[:, cc] = tile[:, cc] * scale32
+                tile_bf16_scaled[:, cc] = tile[:, cc] * scalebf
+            
+            A32_clipped = torch.clamp(tile_fp32_scaled, min=-float(qmax_fp32), max=float(qmax_fp32))
+            Abf_clipped = torch.clamp(tile_bf16_scaled, min=-float(qmax_bf16), max=float(qmax_bf16))
+            A32_scaled_list.append(A32_clipped.to(torch.float32))
+            Abf_scaled_list.append(Abf_clipped.to(torch.bfloat16))
+        
+        if len(A32_scaled_list) > 0:
+            A_fp32_q_list.append(torch.stack(A32_scaled_list, dim=0))
+            A_bf16_q_list.append(torch.stack(Abf_scaled_list, dim=0))
+    
+    if len(A_fp32_q_list) > 0:
+        A_fp32_q = torch.cat(A_fp32_q_list, dim=0)
+        A_bf16_q = torch.cat(A_bf16_q_list, dim=0)
+    else:
+        A_fp32_q = torch.zeros_like(A, dtype=torch.float32)
+        A_bf16_q = torch.zeros_like(A, dtype=torch.bfloat16)
 
     bcsc.A_fp32_q = A_fp32_q
-    bcsc.a_scale_fp32 = a_scale32
+    bcsc.a_scale_fp32 = a_scale_fp32_per_col
     bcsc.A_bf16_q = A_bf16_q
-    bcsc.a_scale_bf16 = a_scalebf
+    bcsc.a_scale_bf16 = a_scale_bf16_per_col
     return bcsc
 
 
@@ -389,17 +464,28 @@ def spmv_bcsc_mixed_ref_prequant(
                 continue
 
             if action == 1:
-                a_scale = bcsc.a_scale_fp32[k]
                 # represent a_q as f64-carrying lowp value
                 a_q_f64 = bcsc.A_fp32_q[k].to(torch.float64)
             elif action == 2:
-                a_scale = bcsc.a_scale_bf16[k]
                 a_q_f64 = bcsc.A_bf16_q[k].to(torch.float64)
             else:
                 raise ValueError(f"Unsupported action {action}, expected 0/1/2")
 
+            # Per-column scaling: each column cc uses scale[col_base + cc]
             prod_q = _lowp_mul_to_f64(a_q_f64, x_q_f64[None, :], action)  # [R,C] f64
-            acc = torch.sum(prod_q, dim=1) / (a_scale * x_scale)
+            
+            # Dequantize per column: for each column cc, divide by (a_scale[col_base + cc] * x_scale)
+            acc = torch.zeros((R,), dtype=torch.float64, device=out_full.device)
+            for cc in range(C):
+                global_col = col_base + cc
+                if global_col >= bcsc.N:
+                    break
+                if action == 1:
+                    a_scale_col = bcsc.a_scale_fp32[global_col]
+                else:  # action == 2
+                    a_scale_col = bcsc.a_scale_bf16[global_col]
+                acc += prod_q[:, cc] / (a_scale_col * x_scale)
+            
             out_full[row_base : row_base + R] += acc
 
     return out_full[: bcsc.M] if trim_to_M else out_full
@@ -458,14 +544,51 @@ def spmv_bcsc_mixed_ref_runtime_quant(
                 out_full[row_base : row_base + R] += torch.sum(bcsc.A_fp64[k] * x_tile[None, :], dim=1)
                 continue
 
-            A_tile = bcsc.A_fp64[k]
-            a_max_abs = torch.max(torch.abs(A_tile))
-            a_scale = torch.tensor(float(max_val), dtype=torch.float64, device=out_full.device) / (
-                a_max_abs + float(eps)
-            )
-            a_q_f64 = _quantize_scaled_value_f64(A_tile, a_scale, max_val, action)  # [R,C] f64-carrying
+            # Runtime quantization: compute scale per column
+            A_tile = bcsc.A_fp64[k]  # [R, C]
+            
+            # Quantize per column: for each column cc, compute scale based on that column
+            a_q_f64_list = []
+            a_scale_list = []
+            for cc in range(C):
+                global_col = col_base + cc
+                if global_col >= bcsc.N:
+                    break
+                
+                # Find max absolute value in this column across all tiles in this block-column
+                col_start = int(bcsc.colptr[bc].item())
+                col_end = int(bcsc.colptr[bc + 1].item())
+                if col_end > col_start:
+                    col_tiles = bcsc.A_fp64[col_start:col_end]  # [num_tiles, R, C]
+                    col_values = col_tiles[:, :, cc]  # [num_tiles, R]
+                    a_max_abs_col = torch.max(torch.abs(col_values))
+                else:
+                    a_max_abs_col = torch.tensor(0.0, dtype=torch.float64, device=out_full.device)
+                
+                a_scale_col = torch.tensor(float(max_val), dtype=torch.float64, device=out_full.device) / (
+                    a_max_abs_col + float(eps)
+                )
+                a_scale_list.append(a_scale_col)
+                
+                # Quantize this column of the tile
+                col_tile = A_tile[:, cc]  # [R]
+                col_q = _quantize_scaled_value_f64(col_tile, a_scale_col, max_val, action)  # [R] f64-carrying
+                a_q_f64_list.append(col_q)
+            
+            # Reconstruct quantized tile [R, C]
+            if len(a_q_f64_list) > 0:
+                a_q_f64 = torch.stack(a_q_f64_list, dim=1)  # [R, C]
+            else:
+                a_q_f64 = A_tile
+            
             prod_q = _lowp_mul_to_f64(a_q_f64, x_q_f64[None, :], action)  # [R,C] f64
-            acc = torch.sum(prod_q, dim=1) / (a_scale * x_scale)
+            
+            # Dequantize per column
+            acc = torch.zeros((R,), dtype=torch.float64, device=out_full.device)
+            for idx, cc in enumerate(range(min(C, bcsc.N - col_base))):
+                a_scale_col = a_scale_list[idx]
+                acc += prod_q[:, cc] / (a_scale_col * x_scale)
+            
             out_full[row_base : row_base + R] += acc
 
     return out_full[: bcsc.M] if trim_to_M else out_full

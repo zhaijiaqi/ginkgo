@@ -61,20 +61,37 @@ def main():
 
     # Locate T22 in our toy ordering: k=4 is (bc=2, br=2)
     k = 4
+    bc = 2  # T22 is in block-column 2
     A_tile = bcsc.A_fp64[k].cpu().numpy()
     exp_tile = np.array([[-3, -4], [0, 12]], dtype=np.float64)
     assert np.allclose(A_tile, exp_tile, atol=0.0, rtol=0.0), "T22 tile mismatch (build ordering changed?)"
 
-    max_abs = np.max(np.abs(exp_tile))
-    exp_scale = float(DEFAULT_QMAX_F64) / (float(max_abs) + float(DEFAULT_EPS_F64))
+    # Scale is now computed per column: find max abs for each column in block-column bc=2
+    # Column bc=2 spans columns 4 and 5 (since tilesize=2, bc=2 means columns 4-5)
+    # T22 tile is at (br=2, bc=2), which corresponds to rows 4-5, columns 4-5
+    # We need to check the scale for columns 4 and 5
+    col_base = bc * bcsc.C  # bc=2, C=2, so col_base=4
+    col_4_max_abs = np.max(np.abs([bcsc.A_fp64[3, :, 0].cpu().numpy(), bcsc.A_fp64[4, :, 0].cpu().numpy()]))  # Column 4 from T02 and T22
+    col_5_max_abs = np.max(np.abs([bcsc.A_fp64[3, :, 1].cpu().numpy(), bcsc.A_fp64[4, :, 1].cpu().numpy()]))  # Column 5 from T02 and T22
+    
+    exp_scale_col4 = float(DEFAULT_QMAX_F64) / (float(col_4_max_abs) + float(DEFAULT_EPS_F64))
+    exp_scale_col5 = float(DEFAULT_QMAX_F64) / (float(col_5_max_abs) + float(DEFAULT_EPS_F64))
 
-    got_scale32 = float(bcsc.a_scale_fp32[k].item())
-    got_scalebf = float(bcsc.a_scale_bf16[k].item())
-    assert got_scale32 == exp_scale, f"a_scale_fp32 mismatch: {got_scale32} vs {exp_scale}"
-    assert got_scalebf == exp_scale, f"a_scale_bf16 mismatch: {got_scalebf} vs {exp_scale}"
+    got_scale32_col4 = float(bcsc.a_scale_fp32[col_base].item())
+    got_scalebf_col4 = float(bcsc.a_scale_bf16[col_base].item())
+    got_scale32_col5 = float(bcsc.a_scale_fp32[col_base + 1].item())
+    got_scalebf_col5 = float(bcsc.a_scale_bf16[col_base + 1].item())
+    
+    assert got_scale32_col4 == exp_scale_col4, f"a_scale_fp32[4] mismatch: {got_scale32_col4} vs {exp_scale_col4}"
+    assert got_scalebf_col4 == exp_scale_col4, f"a_scale_bf16[4] mismatch: {got_scalebf_col4} vs {exp_scale_col4}"
+    assert got_scale32_col5 == exp_scale_col5, f"a_scale_fp32[5] mismatch: {got_scale32_col5} vs {exp_scale_col5}"
+    assert got_scalebf_col5 == exp_scale_col5, f"a_scale_bf16[5] mismatch: {got_scalebf_col5} vs {exp_scale_col5}"
 
     # Expected quantized-domain values: cast_lowp(clamp(scale * A))
-    scaled = exp_tile * exp_scale
+    # Note: scale is now per-column, so T22 uses different scales for column 4 and column 5
+    scaled = exp_tile.copy()
+    scaled[:, 0] *= exp_scale_col4  # Column 0 of tile corresponds to global column 4
+    scaled[:, 1] *= exp_scale_col5  # Column 1 of tile corresponds to global column 5
     scaled = np.clip(scaled, -float(DEFAULT_QMAX_F64), float(DEFAULT_QMAX_F64))
     # NOTE: some torch builds can't convert bf16 tensors to numpy; compare as torch tensors.
     exp_fp32_q_t = torch.from_numpy(scaled).to(torch.float32)

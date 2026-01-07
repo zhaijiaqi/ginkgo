@@ -52,3 +52,4 @@ env:
   normalize_state: true
   use_torch_state: true
   verbose: true
+  spmv_impl: bcsc_prequant

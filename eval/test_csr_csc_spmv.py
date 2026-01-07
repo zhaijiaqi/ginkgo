@@ -481,10 +481,10 @@ if __name__ == "__main__":
         # Test single matrix
         # test_csr_spmv(matrix_name=args.matrix_name, R=args.R, C=args.C)
         # test_csc_spmv(matrix_name=args.matrix_name, R=args.R, C=args.C)
-        # test_csc_spmv_fp64_cuda_style(matrix_name=args.matrix_name)
+        test_csc_spmv_fp64_cuda_style(matrix_name=args.matrix_name)
         # benchmark_csr_spmv(matrix_name=args.matrix_name, R=args.R, C=args.C)
         # benchmark_csc_spmv(matrix_name=args.matrix_name, R=args.R, C=args.C)
-        benchmark_csc_spmv_fp64_cuda_style(matrix_name=args.matrix_name)
+        # benchmark_csc_spmv_fp64_cuda_style(matrix_name=args.matrix_name)
         
     else:
         # Default: test with random matrix

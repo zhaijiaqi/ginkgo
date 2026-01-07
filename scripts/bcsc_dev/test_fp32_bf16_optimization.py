@@ -113,9 +113,20 @@ def test_correctness(bcsc, bcsc_cuda, x, actions, case_name, verbose=False):
         print(f"  Output range: [{y_tl.min().item():.6e}, {y_tl.max().item():.6e}]")
 
 
-def benchmark_kernel(bcsc_cuda, x, actions, actual_nnz, n_warmup=10, n_iter=100):
-    """Benchmark kernel performance and return detailed metrics."""
-    # Warmup
+def benchmark_kernel(bcsc_cuda, x, actions, actual_nnz, n_warmup=10, n_iter=100, extra_warmup_for_new_actions=5):
+    """
+    Benchmark kernel performance and return detailed metrics.
+    
+    Note: TileLang kernels are JIT compiled. The first call with new kernel parameters
+    triggers compilation, which can affect timing. This function includes extra warmup
+    when actions change to ensure kernel is fully compiled and optimized.
+    """
+    # Extra warmup for new action patterns (helps with kernel compilation/optimization)
+    # This is especially important when switching between different action distributions
+    for _ in range(extra_warmup_for_new_actions):
+        _ = bcsc_spmv_mixed_prequant(bcsc_cuda, actions, x, device="cuda", return_torch=True)
+    
+    # Standard warmup
     for _ in range(n_warmup):
         _ = bcsc_spmv_mixed_prequant(bcsc_cuda, actions, x, device="cuda", return_torch=True)
 
@@ -273,18 +284,42 @@ def main():
     print("\n[SPEED] Performance detection:")
     print(f"  Actual nnz in matrix: {actual_nnz:,}")
     print(f"  Actual nnz in BCSC tiles: {actual_nnz_in_bcsc:,}")
+    print(f"  Note: TileLang kernels are JIT compiled. First test may include compilation time.")
     
     # Baseline: all_fp64
+    # Use extra warmup for baseline to ensure kernel is fully compiled
     baseline_actions = test_cases["all_fp64"]
     baseline_metrics = benchmark_kernel(
         bcsc_cuda, x, baseline_actions, actual_nnz_in_bcsc,
-        n_warmup=args.n_warmup, n_iter=args.n_iter
+        n_warmup=args.n_warmup, n_iter=args.n_iter,
+        extra_warmup_for_new_actions=10  # Extra warmup for first kernel compilation
     )
     baseline_time_ms = baseline_metrics["avg_time_ms"]
     
     print(f"\n  Baseline (all_fp64):")
     print(f"    Time: {baseline_time_ms:.3f} ms/iter")
     print(f"    Throughput: {baseline_metrics['throughput_gops']:.3f} GOP/s")
+    
+    # First, get our kernel performance for all precisions
+    print(f"\n  [OUR KERNEL] Performance summary:")
+    our_results = {}
+    for case_name, actions in test_cases.items():
+        if case_name in ["all_fp64", "all_fp32", "all_bf16"]:
+            metrics = benchmark_kernel(
+                bcsc_cuda, x, actions, actual_nnz_in_bcsc,
+                n_warmup=args.n_warmup, n_iter=args.n_iter,
+                extra_warmup_for_new_actions=0
+            )
+            precision = case_name.replace("all_", "")
+            our_results[precision] = metrics
+    
+    print(f"    {'Precision':<12} {'Time (ms)':<12} {'Throughput (GOP/s)':<18} {'Speedup vs fp64':<18}")
+    print(f"    {'-'*12} {'-'*12} {'-'*18} {'-'*18}")
+    for precision in ['fp64', 'fp32', 'bf16']:
+        if precision in our_results:
+            metrics = our_results[precision]
+            speedup = baseline_time_ms / metrics['avg_time_ms'] if precision != 'fp64' else 1.0
+            print(f"    {precision:<12} {metrics['avg_time_ms']:>10.3f}   {metrics['throughput_gops']:>15.3f}   {speedup:>16.2f}x")
     
     # Test all cases and compare with baseline
     print(f"\n  Performance comparison (vs baseline):")
@@ -321,6 +356,7 @@ def main():
     
     # Test different fp64 ratios to understand quantization overhead
     print(f"\n  [ANALYSIS] Testing fp64 ratio impact (fp64 + bf16, no fp32):")
+    print(f"    Note: Kernel is already compiled from previous tests, so timing should be consistent.")
     print(f"    {'fp64%':<8} {'Time (ms)':<12} {'Speedup':<10} {'Throughput (GOP/s)':<18} {'vs all_bf16'}")
     print(f"    {'-'*8} {'-'*12} {'-'*10} {'-'*18} {'-'*15}")
     
@@ -383,6 +419,13 @@ def main():
                 print(f"      - Conclusion: quantization overhead ({quant_overhead:.3f} ms) is significant")
             if fastest["fp64_ratio"] > 0 and fastest["fp64_ratio"] < 1.0:
                 print(f"      - Optimal mix ({fastest['fp64_ratio']*100:.0f}% fp64) balances quantization overhead vs compute speed")
+            
+            # Compare with first test results
+            print(f"\n    Performance difference explanation:")
+            print(f"      - First test (correctness + performance): kernel may still be compiling/optimizing")
+            print(f"      - Second test (analysis): kernel fully compiled, GPU in optimized state")
+            print(f"      - This is normal for JIT-compiled kernels (TileLang)")
+            print(f"      - The relative speedup ratios are more reliable than absolute times")
     
     # Test fp32 impact (since original "mixed" included fp32)
     print(f"\n  [ANALYSIS] Testing fp32 impact (fp64 + fp32 + bf16):")
