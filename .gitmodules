@@ -1,3 +1,12 @@
-[submodule "third_party/aCG"]
-	path = third_party/aCG
-	url = git@github.com:zhaijiaqi/aCG.git
+[submodule "cg_kernels"]
+	path = cg_kernels
+	url = git@github.com:zhaijiaqi/cg_kernels.git
+[submodule "ginkgo"]
+	path = baselines/ginkgo
+	url = git@github.com:zhaijiaqi/ginkgo.git
+[submodule "petsc"]
+	path = baselines/petsc
+	url = git@github.com:zhaijiaqi/petsc.git
+[submodule "Mille-feuille"]
+	path = baselines/Mille-feuille
+	url = git@github.com:zhaijiaqi/Mille-feuille.git
