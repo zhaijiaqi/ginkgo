@@ -1,0 +1,12 @@
+prefix=${pcfiledir}/../..
+libdir=${prefix}/@GINKGO_INSTALL_LIBDIR@
+includedir=${prefix}/@GINKGO_INSTALL_INCLUDEDIR@
+
+Name: @GINKGO_PROJECT_NAME@
+Description: @GINKGO_DESCRIPTION@
+Version: @GINKGO_VERSION@
+URL: https://ginkgo-project.github.io/
+
+Requires:
+Libs: @GINKGO_INTERFACE_LINK_FLAGS@
+Cflags: @GINKGO_INTERFACE_CXX_FLAGS@

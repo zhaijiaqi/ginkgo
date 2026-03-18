@@ -1,0 +1,2 @@
+ginkgo_create_test(lower_trs_kernels RESOURCE_TYPE hipgpu)
+ginkgo_create_test(upper_trs_kernels RESOURCE_TYPE hipgpu)

@@ -1,0 +1,16 @@
+coverage:
+  status:
+    patch:
+      default:
+        target: auto
+        threshold: 5
+        base: auto
+        informational: True
+    project:
+      default:
+        target: auto
+        threshold: 2
+        base: auto
+  ignore:
+    - "examples"
+    - "benchmark"

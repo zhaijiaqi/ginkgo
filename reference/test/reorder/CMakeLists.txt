@@ -1,0 +1,8 @@
+if(GINKGO_HAVE_METIS)
+    ginkgo_create_test(nested_dissection ADDITIONAL_LIBRARIES METIS::METIS)
+endif()
+ginkgo_create_test(rcm)
+ginkgo_create_test(rcm_kernels)
+ginkgo_create_test(mc64)
+ginkgo_create_test(mc64_kernels)
+ginkgo_create_test(scaled_reordered)

@@ -1,0 +1,2 @@
+ginkgo_create_cuda_test(lower_trs_kernels)
+ginkgo_create_cuda_test(upper_trs_kernels)

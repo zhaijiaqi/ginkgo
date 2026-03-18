@@ -1,0 +1,62 @@
+// SPDX-FileCopyrightText: 2017 - 2024 The Ginkgo authors
+//
+// SPDX-License-Identifier: BSD-3-Clause
+
+namespace {
+
+
+// The function is copied from _ConvertSMVer2Cores of
+// cuda-samples:Common/helper_cuda.h
+inline int convert_sm_ver_to_cores(int major, int minor)
+{
+    // Defines for GPU Architecture types (using the SM version to determine
+    // the # of cores per SM
+    typedef struct {
+        int SM;  // 0xMm (hexadecimal notation), M = SM Major version,
+        // and m = SM minor version
+        int Cores;
+    } sSMtoCores;
+
+    sSMtoCores nGpuArchCoresPerSM[] = {
+        {0x30, 192},  // Kepler Generation (SM 3.0) GK10x class
+        {0x32, 192},  // Kepler Generation (SM 3.2) GK10x class
+        {0x35, 192},  // Kepler Generation (SM 3.5) GK11x class
+        {0x37, 192},  // Kepler Generation (SM 3.7) GK21x class
+        {0x50, 128},  // Maxwell Generation (SM 5.0) GM10x class
+        {0x52, 128},  // Maxwell Generation (SM 5.2) GM20x class
+        {0x53, 128},  // Maxwell Generation (SM 5.3) GM20x class
+        {0x60, 64},   // Pascal Generation (SM 6.0) GP100 class
+        {0x61, 128},  // Pascal Generation (SM 6.1) GP10x class
+        {0x62, 128},  // Pascal Generation (SM 6.2) GP10x class
+        {0x70, 64},   // Volta Generation (SM 7.0) GV100 class
+        {0x72, 64},   // Volta Generation (SM 7.2) GV11b class
+        {0x75, 64},   // Turing Generation (SM 7.5) TU1xx class
+        {0x80, 64},   // Ampere Generation (SM 8.0) GA100 class
+        {0x86, 128},  // Ampere Generation (SM 8.6)
+        {0x87, 128},  // Ampere Generation (SM 8.7)
+        {0x89, 128},  // Ada Generation (SM 8.9)
+        {0x90, 128},  // Hopper Generation (SM 9.0)
+        {-1, -1}};
+
+    int index = 0;
+
+    while (nGpuArchCoresPerSM[index].SM != -1) {
+        if (nGpuArchCoresPerSM[index].SM == ((major << 4) + minor)) {
+            return nGpuArchCoresPerSM[index].Cores;
+        }
+        index++;
+    }
+
+#if GKO_VERBOSE_LEVEL >= 1
+    // If we don't find the values, we use the last valid value by default
+    // to allow proper execution
+    std::cerr << "MapSMtoCores for SM " << major << "." << minor
+              << "is undefined. The default value of "
+              << nGpuArchCoresPerSM[index - 1].Cores << " Cores/SM is used."
+              << std::endl;
+#endif  // GKO_VERBOSE_LEVEL >= 1
+    return nGpuArchCoresPerSM[index - 1].Cores;
+}
+
+
+}  // namespace

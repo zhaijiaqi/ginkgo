@@ -1,0 +1,1 @@
+ginkgo_add_typed_benchmark_executables(preconditioner "NO" preconditioner.cpp)

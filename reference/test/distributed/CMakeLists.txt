@@ -1,0 +1,6 @@
+ginkgo_create_test(assembly_kernels)
+ginkgo_create_test(index_map_kernels)
+ginkgo_create_test(matrix_kernels)
+ginkgo_create_test(partition_helpers_kernels)
+ginkgo_create_test(partition_kernels)
+ginkgo_create_test(vector_kernels)

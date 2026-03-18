@@ -1,0 +1,39 @@
+[
+    {
+        "filename": "",
+        "problem": {
+            "rows": 36,
+            "columns": 36,
+            "nonzeros": 208,
+            "row_distribution": {
+                "min": 4,
+                "q1": 4.5,
+                "median": 6.0,
+                "q3": 7.0,
+                "max": 9,
+                "mean": 1.0,
+                "variance": 1.0,
+                "skewness": 1.0,
+                "kurtosis": 1.0,
+                "hyperskewness": 1.0,
+                "hyperflatness": 1.0
+            },
+            "col_distribution": {
+                "min": 4,
+                "q1": 4.5,
+                "median": 6.0,
+                "q3": 7.0,
+                "max": 9,
+                "mean": 1.0,
+                "variance": 1.0,
+                "skewness": 1.0,
+                "kurtosis": 1.0,
+                "hyperskewness": 1.0,
+                "hyperflatness": 1.0
+            }
+        },
+        "rows": 36,
+        "cols": 36,
+        "nonzeros": 208
+    }
+]
