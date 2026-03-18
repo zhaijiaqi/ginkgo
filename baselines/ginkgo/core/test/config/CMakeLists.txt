@@ -1,0 +1,8 @@
+ginkgo_create_test(config)
+ginkgo_create_test(factorization)
+ginkgo_create_test(multigrid)
+ginkgo_create_test(preconditioner)
+ginkgo_create_test(property_tree)
+ginkgo_create_test(registry)
+ginkgo_create_test(solver)
+ginkgo_create_test(type_descriptor)

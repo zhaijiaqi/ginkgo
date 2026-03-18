@@ -1,0 +1,2 @@
+ginkgo_create_omp_test(kernel_launch)
+ginkgo_create_omp_test(index_set)
