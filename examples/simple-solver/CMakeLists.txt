@@ -8,6 +8,10 @@ endif()
 
 add_executable(simple-solver simple-solver.cpp)
 target_link_libraries(simple-solver Ginkgo::ginkgo)
+# Allow unresolved batch-solver symbols in shared libs (batch kernels are
+# intentionally excluded from the CUDA build to work around nvcc 11.5 + GCC 11
+# std::function template-pack issue; they are not used by simple-solver).
+target_link_options(simple-solver PRIVATE -Wl,--allow-shlib-undefined)
 
 # Copy the data files to the execution directory
 configure_file(data/A.mtx data/A.mtx COPYONLY)
