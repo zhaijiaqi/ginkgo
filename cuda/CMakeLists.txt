@@ -11,26 +11,14 @@ add_instantiation_files(
     matrix/fbcsr_kernels.instantiate.cpp
     FBCSR_INSTANTIATE
 )
-add_instantiation_files(
-    ${PROJECT_SOURCE_DIR}/common/cuda_hip
-    solver/batch_bicgstab_launch.instantiate.cpp
-    BATCH_BICGSTAB_INSTANTIATE1
-)
-add_instantiation_files(
-    .
-    solver/batch_bicgstab_launch.instantiate.cu
-    BATCH_BICGSTAB_INSTANTIATE2
-)
-add_instantiation_files(
-    ${PROJECT_SOURCE_DIR}/common/cuda_hip
-    solver/batch_cg_launch.instantiate.cpp
-    BATCH_CG_INSTANTIATE1
-)
-add_instantiation_files(
-    .
-    solver/batch_cg_launch.instantiate.cu
-    BATCH_CG_INSTANTIATE2
-)
+# batch_bicgstab and batch_cg launch instantiation files are excluded because
+# they include core/solver/batch_dispatch.hpp which triggers a parameter-pack
+# expansion error in std::function when compiled with nvcc 11.5 + GCC 11.
+# These batch solvers are not required for the simple-solver CG benchmark.
+set(BATCH_BICGSTAB_INSTANTIATE1)
+set(BATCH_BICGSTAB_INSTANTIATE2)
+set(BATCH_CG_INSTANTIATE1)
+set(BATCH_CG_INSTANTIATE2)
 # we don't split up the dense kernels into distinct compilations
 list(
     APPEND
@@ -60,8 +48,6 @@ target_sources(
         base/version.cpp
         matrix/fft_kernels.cu
         preconditioner/batch_jacobi_kernels.cu
-        solver/batch_bicgstab_kernels.cu
-        solver/batch_cg_kernels.cu
         solver/lower_trs_kernels.cu
         solver/upper_trs_kernels.cu
 )
